@@ -1,0 +1,8 @@
+/build*/
+/artifacts/
+/backups/
+/examples/Foundry-200.wav
+*.user
+*.autosave
+*.core
+/core
