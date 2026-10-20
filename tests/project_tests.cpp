@@ -1,4 +1,5 @@
 #include "project.h"
+#include <QCryptographicHash>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -102,6 +103,50 @@ int projectTests() {
         empty &= blank.tracks[i].instrument == i && blank.tracks[i].patterns.empty() && blank.tracks[i].clips.empty();
     check(empty, "empty song has six default instruments and no content");
     check(fc::projectFromJson(fc::projectToJson(blank), out, error), "empty arrangement is valid song");
+    const auto showcase = fc::showcaseProject();
+    const auto showcaseJson = fc::projectToJson(showcase);
+    check(showcase.title == "Neon Signal - 2011" && showcase.bpm == 126 && showcase.songBars == 48 &&
+          showcase.tailSeconds == 3, "bundled showcase is the complete authored 48-bar Neon Signal song");
+    check(showcase.master == .76 && showcase.delay == .17 && showcase.duck == .5 && !showcase.metronome,
+          "showcase retains the final authored master mix");
+    const double showcaseVolumes[] = {.36, 1.25, .75, 1.4, .6, .5};
+    const size_t showcaseEvents[] = {140, 144, 429, 202, 82, 320};
+    bool selfContained = true, authoredMix = true, showcaseArrangement = true;
+    size_t totalShowcaseEvents = 0;
+    for (int t = 0; t < fc::TrackCount; ++t) {
+        const auto& track = showcase.tracks[t];
+        selfContained &= track.samplePath.isEmpty() && track.instrument == t;
+        authoredMix &= track.volume == showcaseVolumes[t] && !track.mute && !track.solo;
+        const auto events = fc::scheduledSteps(showcase, t);
+        showcaseArrangement &= events.size() == showcaseEvents[t] && !track.patterns.empty() && !track.clips.empty();
+        totalShowcaseEvents += events.size();
+    }
+    check(selfContained, "showcase uses six built-in instruments without external sample dependencies");
+    check(authoredMix, "showcase retains all final track levels and audible tracks");
+    check(showcaseArrangement && totalShowcaseEvents == 1317 && fc::contentEndBar(showcase) == 48,
+          "showcase schedules the complete 1317-note arrangement through its outro");
+    const auto& showcaseLead = showcase.tracks[3];
+    check(showcaseLead.patterns.size() == 4 && showcaseLead.patterns[0].name == "04 Neon chorus hook" &&
+          showcaseLead.patterns[3].name == "04 Final chorus harmony" &&
+          showcaseLead.patterns[0].steps[0].notes.size() == 1 &&
+          showcaseLead.patterns[3].steps[0].notes.size() == 2,
+          "final chorus adds harmony in a separate editable phrase");
+    bool firstChorus = false, lastChorus = false;
+    for (const auto& clip : showcaseLead.clips) {
+        firstChorus |= clip.startBar == 16 && clip.lengthBars == 8 && clip.pattern == 0;
+        lastChorus |= clip.startBar == 32 && clip.lengthBars == 12 && clip.pattern == 3;
+    }
+    check(firstChorus && lastChorus, "original and harmonized hooks play in their respective choruses");
+    check(fc::projectFromJson(showcaseJson, out, error) && fc::projectToJson(out) == showcaseJson,
+          "complete showcase survives editable project serialization unchanged");
+    QFile embeddedShowcase(":/showcase/Neon-Signal-2011.ferro");
+    check(embeddedShowcase.open(QIODevice::ReadOnly), "embedded showcase artifact is available");
+    const auto embeddedShowcaseBytes = embeddedShowcase.readAll();
+    // Lock to the authored, bundled example without requiring source files at runtime.
+    const QByteArray authoredShowcaseHash = "2d8b2631d9df1d85acc76162149d775ab13f5e426de0b69af2066f258f9b8242";
+    check(QCryptographicHash::hash(embeddedShowcaseBytes, QCryptographicHash::Sha256).toHex() == authoredShowcaseHash &&
+          QJsonDocument::fromJson(embeddedShowcaseBytes).object() == showcaseJson,
+          "embedded startup project exactly matches the bundled authored JSON");
     auto reject = [&](QJsonObject bad, const char* reason) {
         out = p;
         out.title = "unchanged";

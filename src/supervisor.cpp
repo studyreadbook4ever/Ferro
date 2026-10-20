@@ -441,7 +441,12 @@ struct Supervisor::Impl {
         }
         workers.clear();
         mixer->disconnect(q);
-        mixer->future().waitForFinished();
+        // takeResult() invalidates this shared future. In Qt 6.4 it also clears
+        // Finished, so waiting on a consumed result would never return. A live
+        // mix still owns a valid future and must finish before Impl is released.
+        auto future = mixer->future();
+        if (future.isValid())
+            future.waitForFinished();
         mixing.reset();
         latest.reset();
         emit q->statusChanged();

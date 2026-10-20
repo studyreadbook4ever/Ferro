@@ -1,6 +1,9 @@
 #include "window.h"
+#include "agent.h"
+#include "agent_ipc.h"
 #include "dsp.h"
 #include <QAction>
+#include <QAbstractSpinBox>
 #include <QApplication>
 #include <QBoxLayout>
 #include <QCheckBox>
@@ -16,6 +19,7 @@
 #include <QFutureWatcher>
 #include <QGroupBox>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenuBar>
@@ -32,7 +36,9 @@
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QTest>
+#include <QTemporaryDir>
 #include <QTimer>
+#include <QUuid>
 #include <QWheelEvent>
 #include <QtConcurrent>
 #include <algorithm>
@@ -138,9 +144,25 @@ Window::Window(bool mode) : supervisor(this), smoke(mode) {
     });
     autosave->start();
     resetHistory();
+    selectShowcasePreview();
     refreshProject();
+    QTimer::singleShot(0, this, [this] {
+        timeline->fitZoom(timelineScroll->viewport()->width());
+        const QSignalBlocker blocker(zoom);
+        zoom->setValue(int(std::round(timeline->scale)));
+    });
+    if (!smoke) {
+        agentServer = new AgentServer(this, [this](const QJsonObject& request) {
+            return handleAgentRequest(request);
+        });
+        QString error;
+        if (!agentServer->listen(error))
+            report("Agent connection unavailable: " + error);
+    }
     if (!smoke && QFileInfo::exists(autosavePath))
         QTimer::singleShot(0, this, [this] {
+            if (!projectPath.isEmpty())
+                return;
             if (QMessageBox::question(this, "Recover song", "An autosaved song is available. Recover it?") ==
                 QMessageBox::Yes) {
                 Project p;
@@ -1102,6 +1124,203 @@ void Window::stopPlayback() {
 void Window::report(const QString& message) {
     statusBar()->showMessage(message, 15000);
 }
+void Window::selectShowcasePreview() {
+    const auto& clips = project.tracks[3].clips;
+    const auto chorus = std::find_if(clips.begin(), clips.end(), [](const Clip& clip) {
+        return clip.startBar == 16;
+    });
+    if (chorus != clips.end()) {
+        timeline->track = 3;
+        timeline->selectedClip = chorus->id;
+    }
+}
+void Window::adoptProject(Project replacement, const QString& path, bool showcasePreview) {
+    audio.clear();
+    previewSeek = 0;
+    queuedSeekBar = -1;
+    resumeAfterSeek = false;
+    audioRevision = 0;
+    preparedState = {};
+    project = std::move(replacement);
+    projectPath = path;
+    dirty = false;
+    timeline->selectedClip = 0;
+    timeline->track = 0;
+    // A different song can reuse the same track/phrase indexes. Invalidate the
+    // previous editor selection so refreshProject selects and fits its new notes.
+    editor->select(-1, -1);
+    if (showcasePreview)
+        selectShowcasePreview();
+    resetHistory();
+    refreshProject();
+    timeline->fitZoom(timelineScroll->viewport()->width());
+    {
+        const QSignalBlocker blocker(zoom);
+        zoom->setValue(int(std::round(timeline->scale)));
+    }
+    renderTimer->start();
+}
+bool Window::openProjectPath(const QString& path, QString& error) {
+    if (dirty) {
+        error = "The current song has unsaved changes. Save it before opening another song.";
+        return false;
+    }
+    Project replacement;
+    if (!loadProject(path, replacement, error))
+        return false;
+    adoptProject(std::move(replacement), QFileInfo(path).absoluteFilePath());
+    report("Opened " + projectPath);
+    return true;
+}
+QJsonObject Window::handleAgentRequest(const QJsonObject& request) {
+    if (!request.value("command").isString())
+        return agentError("invalid_request", "command must be a string.");
+    const auto command = request.value("command").toString();
+    QStringList allowed{"command"};
+    if (command == "apply")
+        allowed << "plan" << "expected_revision" << "dry_run";
+    else if (command == "save")
+        allowed << "path" << "force";
+    else if (command == "open")
+        allowed << "path" << "force" << "expected_revision";
+    else if (command == "new")
+        allowed << "demo" << "force" << "expected_revision";
+    else if (command != "inspect" && command != "status" && command != "play" && command != "stop")
+        return agentError("unknown_command", "Use inspect, status, apply, save, open, new, play, or stop.");
+    for (auto it = request.begin(); it != request.end(); ++it)
+        if (!allowed.contains(it.key()))
+            return agentError("unknown_field", "Unknown " + command + " field: " + it.key());
+    for (const auto& field : {QString("force"), QString("dry_run"), QString("demo")})
+        if (request.contains(field) && !request.value(field).isBool())
+            return agentError("invalid_request", field + " must be a boolean.");
+    if (request.contains("path") &&
+        (!request.value("path").isString() || request.value("path").toString().isEmpty()))
+        return agentError("invalid_request", "path must be a nonempty string.");
+    if (request.contains("expected_revision") && !request.value("expected_revision").isString())
+        return agentError("invalid_request", "expected_revision must be the string returned by inspect.");
+    const auto currentRevision = agentRevision(project);
+    if (request.contains("expected_revision") &&
+        request.value("expected_revision").toString() != currentRevision)
+        return agentError("revision_conflict", "The song changed. Inspect it again before applying edits.");
+    const bool mutating = (command == "apply" && !request.value("dry_run").toBool()) ||
+                          command == "open" || command == "new" || command == "save";
+    if (mutating) {
+        auto* focused = QApplication::focusWidget();
+        auto* number = qobject_cast<QAbstractSpinBox*>(focused);
+        auto* text = qobject_cast<QLineEdit*>(focused);
+        if (!number && text)
+            number = qobject_cast<QAbstractSpinBox*>(text->parentWidget());
+        if (number && !text)
+            text = number->findChild<QLineEdit*>();
+        if (number && isAncestorOf(number) && !number->keyboardTracking() &&
+            text && text->isModified())
+            return agentError("ui_edit_in_progress",
+                              "A number is being typed in Ferro. Finish it with Enter or leave the field, "
+                              "then inspect and retry. No edit was applied.");
+    }
+    auto state = [this] {
+        return QJsonObject{{"ok", true}, {"revision", agentRevision(project)},
+                           {"path", projectPath}, {"dirty", dirty},
+                           {"playing", audio.playing()},
+                           {"play_pending", queuedSeekBar >= 0 && resumeAfterSeek}};
+    };
+    if (command == "inspect" || command == "status") {
+        auto result = state();
+        if (command == "inspect") {
+            result.insert("data", agentInspect(project));
+            result.insert("project", projectToJson(project));
+        }
+        return result;
+    }
+    if (command == "apply") {
+        if (!request.contains("expected_revision"))
+            return agentError("revision_required", "Live apply requires expected_revision from inspect.");
+        if (!request.value("plan").isObject())
+            return agentError("invalid_request", "plan must be an object containing version and operations.");
+        Project candidate;
+        QJsonObject response;
+        if (!agentApply(project, request.value("plan").toObject(), candidate, response))
+            return response;
+        const bool dryRun = request.value("dry_run").toBool();
+        response.insert("dry_run", dryRun);
+        response.insert("base_revision", currentRevision);
+        if (!dryRun && projectToJson(candidate) != projectToJson(project)) {
+            project = std::move(candidate);
+            refreshProject();
+            change();
+            report("Agent applied " + QString::number(request.value("plan").toObject()
+                                                         .value("operations").toArray().size()) +
+                   " operations. Undo restores the previous song.");
+        }
+        response.insert("path", projectPath);
+        response.insert("dirty", dirty);
+        return response;
+    }
+    if (command == "save") {
+        auto path = request.value("path").toString(projectPath);
+        if (path.isEmpty())
+            return agentError("path_required", "The song has no file yet. Supply an absolute path.");
+        if (!path.endsWith(".ferro", Qt::CaseInsensitive))
+            return agentError("invalid_path", "Live save paths must end in .ferro. Use save --live --output /absolute/path/Song.ferro.");
+        const auto destination = QFileInfo(path).absoluteFilePath();
+        const auto current = projectPath.isEmpty() ? QString() : QFileInfo(projectPath).absoluteFilePath();
+        const auto destinationInfo = QFileInfo(destination);
+        const auto currentInfo = QFileInfo(current);
+        const bool sameFile = destination == current ||
+            (destinationInfo.exists() && currentInfo.exists() &&
+             destinationInfo.canonicalFilePath() == currentInfo.canonicalFilePath());
+        if (destinationInfo.exists() && !sameFile && !request.value("force").toBool())
+            return agentError("file_exists", "Destination already exists. Use force only to overwrite it intentionally.");
+        QString error;
+        if (!saveProject(destination, project, error))
+            return agentError("save_failed", error);
+        projectPath = destination;
+        dirty = false;
+        savedState = projectToJson(project);
+        QFile::remove(autosavePath);
+        setWindowTitle("FERRO · " + project.title);
+        report("Saved " + projectPath);
+        return state();
+    }
+    if (command == "open" || command == "new") {
+        if (dirty && !request.value("force").toBool())
+            return agentError("unsaved_changes", "Save the current song first, or use force to discard its changes intentionally.");
+        Project replacement;
+        QString path, error;
+        if (command == "open") {
+            if (!request.contains("path"))
+                return agentError("path_required", "open requires a project path.");
+            path = QFileInfo(request.value("path").toString()).absoluteFilePath();
+            if (!loadProject(path, replacement, error))
+                return agentError("open_failed", error);
+        } else {
+            replacement = request.value("demo").toBool() ? showcaseProject() : emptyProject();
+        }
+        adoptProject(std::move(replacement), path,
+                     command == "new" && request.value("demo").toBool());
+        report(command == "open" ? "Opened " + path : "Created song");
+        return state();
+    }
+    if (command == "stop") {
+        stopPlayback();
+        return state();
+    }
+    if (!audio.playing() && !(queuedSeekBar >= 0 && resumeAfterSeek)) {
+        if (audio.deviceName().isEmpty()) {
+            QString error;
+            if (!audio.open(error))
+                return agentError("audio_unavailable", error);
+        }
+        if (!audioRevision || audio.revision() != audioRevision || preparedState != projectToJson(project)) {
+            resumeAfterSeek = true;
+            requestSeek(queuedSeekBar >= 0 ? queuedSeekBar :
+                        double(audio.position()) / (SampleRate * 240. / project.bpm));
+        } else {
+            audio.setPlaying(true);
+        }
+    }
+    return state();
+}
 void Window::recoverSession(Project p) {
     audio.clear();
     previewSeek = 0;
@@ -1120,20 +1339,7 @@ void Window::recoverSession(Project p) {
 void Window::newSession(bool demo) {
     if (!confirmDiscard())
         return;
-    audio.clear();
-    previewSeek = 0;
-    queuedSeekBar = -1;
-    resumeAfterSeek = false;
-    audioRevision = 0;
-    preparedState = {};
-    project = demo ? demoProject() : emptyProject();
-    projectPath.clear();
-    dirty = false;
-    timeline->selectedClip = 0;
-    timeline->track = 0;
-    resetHistory();
-    refreshProject();
-    renderTimer->start();
+    adoptProject(demo ? showcaseProject() : emptyProject(), {}, demo);
 }
 void Window::open() {
     if (!confirmDiscard())
@@ -1323,12 +1529,144 @@ int Window::smokeTest(const QString& screenshot) {
     deletionResponder.start(5);
     auto answerDeletion = [&](bool accepted) { deletionAnswers.push_back(accepted); };
     show();
+    QTest::qWait(10);
+    check(project.title == "Neon Signal - 2011" && project.songBars == 48 && project.bpm == 126,
+          "fresh startup displays the bundled Neon Signal showcase");
+    check(timeline->track == 3 && timeline->selection() &&
+              timeline->selection()->startBar == 16 && editor->phrase() &&
+              editor->phrase()->name == "04 Neon chorus hook" && editor->step == 0 &&
+              editor->selectedNote() && editor->selectedPitch == 76,
+          "the showcase opens its original Lead chorus in a populated piano roll");
+    check(Timeline::Header + project.songBars * timeline->scale <=
+              timelineScroll->viewport()->width() + 1,
+          "the entire showcase arrangement is visible at startup");
+    check(!audio.playing() && !dirty && !agentServer,
+          "startup does not play or modify the showcase, and smoke mode has no live endpoint");
+    check(handleAgentRequest({{"command", "new"}, {"demo", true}}).value("ok").toBool() &&
+              timeline->track == 3 && timeline->selection() &&
+              timeline->selection()->startBar == 16 && editor->phrase() && editor->selectedNote() &&
+              !audio.playing() && !dirty,
+          "live new demo also previews the chorus without playing or changing its music");
+    {
+        const QString endpoint = "ferro-test-" + QUuid::createUuid().toString(QUuid::Id128);
+        AgentServer isolated(this, [this](const QJsonObject& request) {
+            return handleAgentRequest(request);
+        }, endpoint);
+        QString error;
+        check(isolated.listen(error), "an isolated user-only agent socket listens");
+        AgentServer duplicate(this, [](const QJsonObject&) { return QJsonObject{}; }, endpoint);
+        check(!duplicate.listen(error), "a second server never removes a live endpoint");
+        auto future = QtConcurrent::run([endpoint] {
+            return sendAgentRequest({{"command", "inspect"}}, 3000, endpoint);
+        });
+        QElapsedTimer deadline;
+        deadline.start();
+        while (!future.isFinished() && deadline.elapsed() < 4000)
+            QTest::qWait(10);
+        check(future.isFinished(), "the GUI serves CLI requests without blocking its event loop");
+        if (future.isFinished()) {
+            const auto reply = future.result();
+            check(reply.value("ok").toBool() &&
+                      reply.value("revision").toString() == agentRevision(project) &&
+                      reply.value("project").toObject() == projectToJson(project),
+                  "an actual local socket returns a complete current GUI snapshot");
+        }
+    }
     project = emptyProject();
     project.songBars = 8;
     timeline->selectedClip = 0;
     resetHistory();
     refreshProject();
     QTest::qWait(80);
+    {
+        const auto before = projectToJson(project);
+        const auto revision = agentRevision(project);
+        const int originalHistory = historyIndex;
+        QJsonObject plan{{"version", 1}, {"operations", QJsonArray{
+            QJsonObject{{"op", "song.set"}, {"title", "CLI transaction"}},
+            QJsonObject{{"op", "song.set"}, {"tempo", 128}}
+        }}};
+        auto request = QJsonObject{{"command", "apply"}, {"plan", plan}};
+        check(!handleAgentRequest(request).value("ok").toBool(),
+              "live changes require an inspected revision");
+        request.insert("expected_revision", revision);
+        auto invalidPlan = plan;
+        invalidPlan.insert("operations", QJsonArray{
+            QJsonObject{{"op", "song.set"}, {"title", "Must remain unapplied"}},
+            QJsonObject{{"op", "track.set"}, {"track", 0}, {"name", "Invalid track"}}
+        });
+        auto invalidRequest = request;
+        invalidRequest.insert("plan", invalidPlan);
+        check(!handleAgentRequest(invalidRequest).value("ok").toBool() &&
+                  projectToJson(project) == before && historyIndex == originalHistory && !dirty,
+              "a late invalid operation leaves the GUI song and undo history untouched");
+        request.insert("dry_run", true);
+        const auto preview = handleAgentRequest(request);
+        check(preview.value("ok").toBool() && preview.value("dry_run").toBool() &&
+                  projectToJson(project) == before && historyIndex == originalHistory && !dirty,
+              "live dry run validates the full batch without editing the song");
+        request.insert("dry_run", false);
+        timeline->track = 2;
+        audio.setPlaying(true);
+        const auto applied = handleAgentRequest(request);
+        check(applied.value("ok").toBool() && project.title == "CLI transaction" &&
+                  project.bpm == 128 && historyIndex == originalHistory + 1 && dirty &&
+                  timeline->track == 2 && audio.playing() &&
+                  applied.value("revision").toString() == agentRevision(project),
+              "a live batch makes one undo step, preserves track and transport, and returns its revision");
+        stopPlayback();
+        QString openError;
+        check(!openProjectPath(":/showcase/Neon-Signal-2011.ferro", openError),
+              "startup path opening refuses to discard an unsaved song");
+        check(!handleAgentRequest({{"command", "new"}}).value("ok").toBool() &&
+                  project.title == "CLI transaction",
+              "live new refuses to discard the user's unsaved song");
+        const auto after = projectToJson(project);
+        check(!handleAgentRequest(request).value("ok").toBool() && projectToJson(project) == after &&
+                  historyIndex == originalHistory + 1,
+              "stale live edits cannot overwrite a changed song");
+        check(!handleAgentRequest({{"command", "open"}, {"path", "/missing/ferro-project"},
+                                    {"force", true}}).value("ok").toBool() &&
+                  projectToJson(project) == after,
+              "even forced open validates a replacement before discarding the current song");
+        undo(-1);
+        check(projectToJson(project) == before && agentRevision(project) == revision && !dirty,
+              "one GUI undo restores every operation and the original revision");
+        undo(1);
+        check(projectToJson(project) == after, "GUI redo restores the full CLI transaction");
+        undo(-1);
+        resetHistory();
+        timeline->track = 0;
+        refreshProject();
+        QTemporaryDir files;
+        const QString destination = files.filePath("live.ferro");
+        const QString invalidDestination = files.filePath("live.wav");
+        const auto invalidSave = handleAgentRequest({{"command", "save"}, {"path", invalidDestination}});
+        check(invalidSave.value("error").toObject().value("code").toString() == "invalid_path" &&
+                  !QFileInfo::exists(invalidDestination) && projectPath.isEmpty() &&
+                  projectToJson(project) == before && savedState == before && !dirty,
+              "live save rejects a WAV path without writing or changing GUI state");
+        QFile sentinel(destination);
+        check(sentinel.open(QIODevice::WriteOnly) && sentinel.write("preserve") == 8,
+              "prepare an existing save destination");
+        sentinel.close();
+        check(!handleAgentRequest({{"command", "save"}, {"path", destination}})
+                   .value("ok").toBool() && projectPath.isEmpty(),
+              "live save does not overwrite another existing file without force");
+        const auto saved = handleAgentRequest({{"command", "save"}, {"path", destination},
+                                               {"force", true}});
+        Project loaded;
+        QString error;
+        check(saved.value("ok").toBool() && !dirty && savedState == before &&
+                  loadProject(destination, loaded, error) && projectToJson(loaded) == before,
+              "forced live save persists a valid project and updates the GUI saved state");
+        check(handleAgentRequest({{"command", "save"}}).value("ok").toBool(),
+              "subsequent live save uses the song's current path");
+        check(openProjectPath(destination, error) && timeline->selectedClip == 0 &&
+                  timeline->track == 0 && !editor->phrase(),
+              "explicit project opening preserves the normal empty selection convention");
+        projectPath.clear();
+    }
     const std::array<QSpinBox*, 8> editableSoundValues = {
         trackSoundValue[0], trackSoundValue[1],  trackSoundValue[2],  trackSoundValue[3],
         trackSoundValue[4], masterSoundValue[0], masterSoundValue[1], masterSoundValue[2]};
@@ -1342,6 +1680,57 @@ int Window::smokeTest(const QString& screenshot) {
         if (commit)
             QTest::keyClick(field, Qt::Key_Return);
     };
+    {
+        const auto beforeDraft = projectToJson(project);
+        const auto beforeRevision = agentRevision(project);
+        const bool beforeDirty = dirty;
+        const auto beforePath = projectPath;
+        const int beforeHistory = historyIndex;
+        typeNumber(trackSoundValue[0], 91, false);
+        auto* field = trackSoundValue[0]->findChild<QLineEdit*>();
+        auto* focused = QApplication::focusWidget();
+        const auto draftText = field ? field->text() : QString();
+        QJsonObject plan{{"version", 1}, {"operations", QJsonArray{
+            QJsonObject{{"op", "song.set"}, {"title", "Apply after the human finishes typing"}}
+        }}};
+        QJsonObject request{{"command", "apply"}, {"expected_revision", beforeRevision}, {"plan", plan}};
+        const auto refused = handleAgentRequest(request);
+        check(field && field->isModified() &&
+                  refused.value("error").toObject().value("code").toString() == "ui_edit_in_progress",
+              "a live change is refused while a human number draft is pending");
+        check(field && field->text() == draftText && QApplication::focusWidget() == focused &&
+                  projectToJson(project) == beforeDraft && dirty == beforeDirty &&
+                  projectPath == beforePath && historyIndex == beforeHistory &&
+                  agentRevision(project) == beforeRevision,
+              "refusing a live change preserves the human draft, focus, song, saved state, and revision");
+        for (const auto& command : {QString("new"), QString("open"), QString("save")}) {
+            QJsonObject other{{"command", command}, {"force", true}};
+            if (command == "open") other.insert("path", ":/showcase/Neon-Signal-2011.ferro");
+            const auto result = handleAgentRequest(other);
+            check(result.value("error").toObject().value("code").toString() == "ui_edit_in_progress",
+                  "file writes and project replacement also preserve a pending human draft");
+        }
+        auto preview = request;
+        preview.insert("dry_run", true);
+        check(handleAgentRequest({{"command", "inspect"}}).value("ok").toBool() &&
+                  handleAgentRequest(preview).value("ok").toBool() && field && field->text() == draftText,
+              "read-only inspection and dry run remain available while a human types");
+        QTest::keyClick(trackSoundValue[0], Qt::Key_Return);
+        check(project.tracks[0].volume == .91,
+              "the human can commit the original number draft with Enter");
+        const auto committed = projectToJson(project);
+        request.insert("expected_revision", agentRevision(project));
+        const auto applied = handleAgentRequest(request);
+        check(applied.value("ok").toBool() &&
+                  project.title == "Apply after the human finishes typing" && project.tracks[0].volume == .91,
+              "live changes work after the human commits the number without losing that edit");
+        undo(-1);
+        check(projectToJson(project) == committed, "undo the agent change preserves the committed human number");
+        undo(-1);
+        check(projectToJson(project) == beforeDraft, "undo restores the draft test's original song");
+        resetHistory();
+        refreshProject();
+    }
     for (size_t i = 0; i < editableSoundValues.size(); ++i) {
         const auto beforeTyping = projectToJson(project);
         const int historyBefore = historyIndex;
@@ -1945,6 +2334,11 @@ int Window::smokeTest(const QString& screenshot) {
           "seek uses acknowledged longer render and its actual tempo");
     dirty = false;
     newSession(true);
+    check(timeline->track == 3 && timeline->selection() &&
+              timeline->selection()->startBar == 16 && editor->phrase() && editor->step == 0 &&
+              editor->selectedNote() && editor->selectedPitch == 76 &&
+              !audio.playing() && !dirty,
+          "Open demo selects the original chorus without starting playback or editing the song");
     timeline->track = 0;
     timeline->selectedClip = project.tracks[0].clips.empty() ? 0 : project.tracks[0].clips.front().id;
     resetHistory();

@@ -1,4 +1,5 @@
 #include "dsp.h"
+#include "agent.h"
 #include "project.h"
 #include "window.h"
 #include <QApplication>
@@ -17,11 +18,12 @@
 #include <stdexcept>
 
 int projectTests();
+int agentTests();
 int dspTests();
 int audioTests();
 int supervisorTests();
 int main(int argc, char** argv) {
-    bool graphical = true;
+    bool graphical = !(argc > 1 && QString::fromLocal8Bit(argv[1]) == "agent");
     for (int i = 1; i < argc; ++i)
         if (QString(argv[i]) == "--worker" || QString(argv[i]) == "--self-test" ||
             QString(argv[i]) == "--render" || QString(argv[i]) == "--help" ||
@@ -34,9 +36,11 @@ int main(int argc, char** argv) {
         app = std::make_unique<QCoreApplication>(argc, argv);
     app->setApplicationName("ferro");
     app->setOrganizationName("Ferro");
-    app->setApplicationVersion("2.2.1");
+    app->setApplicationVersion("2.3.0");
     QStringList args = app->arguments();
     try {
+        if (args.value(1) == "agent")
+            return fc::agentMain(args.mid(2));
         if (args.contains("--worker"))
             return fc::workerMain();
         if (args.contains("--probe-audio")) {
@@ -69,7 +73,8 @@ int main(int argc, char** argv) {
             return ok ? 0 : 1;
         }
         if (args.contains("--self-test")) {
-            int failures = projectTests() + dspTests() + audioTests() + supervisorTests();
+            std::cout << std::unitbuf;
+            int failures = projectTests() + agentTests() + dspTests() + audioTests() + supervisorTests();
             std::cout << "FERRO tests: " << failures << " failures\n";
             return failures ? 1 : 0;
         }
@@ -77,6 +82,7 @@ int main(int argc, char** argv) {
             std::cout << "FERRO · Linux song studio\n\nferro                         Open "
                          "workstation\nferro --render demo --output FILE.wav\nferro --render "
                          "FILE.ferro --output FILE.wav\nferro --write-demo FILE.ferro\nferro "
+                         "--open FILE.ferro           Open a saved song in the GUI\nferro-agent help              Agent-only JSON CLI (also: ferro agent help)\nferro "
                          "--self-test\nferro --probe-audio            Silent 5-second hardware "
                          "check\nQT_QPA_PLATFORM=offscreen ferro --smoke-gui [--screenshot FILE.png]\n";
             return 0;
@@ -86,7 +92,7 @@ int main(int argc, char** argv) {
             if (i + 1 >= args.size())
                 throw std::runtime_error("--write-demo requires a destination.");
             QString error;
-            if (!fc::saveProject(args[i + 1], fc::demoProject(), error))
+            if (!fc::saveProject(args[i + 1], fc::showcaseProject(), error))
                 throw std::runtime_error(error.toStdString());
             return 0;
         }
@@ -95,7 +101,7 @@ int main(int argc, char** argv) {
                 rep = args.indexOf("--repeat");
             if (index + 1 >= args.size() || out < 0 || out + 1 >= args.size())
                 throw std::runtime_error("Usage: --render demo|PROJECT --output FILE.wav");
-            fc::Project project = fc::demoProject();
+            fc::Project project = fc::showcaseProject();
             QString error;
             if (args[index + 1] != "demo" && !fc::loadProject(args[index + 1], project, error))
                 throw std::runtime_error(error.toStdString());
@@ -124,6 +130,14 @@ int main(int argc, char** argv) {
             }
         }
         fc::Window window(smoke);
+        if (args.contains("--open")) {
+            const int index = args.indexOf("--open");
+            QString error;
+            if (index + 1 >= args.size() || args[index + 1].startsWith("--"))
+                throw std::runtime_error("--open requires a project path.");
+            if (!window.openProjectPath(args[index + 1], error))
+                throw std::runtime_error(error.toStdString());
+        }
         window.show();
         if (smoke) {
             int i = args.indexOf("--screenshot");

@@ -20,17 +20,20 @@ class QScrollArea;
 class QScrollBar;
 class QAction;
 namespace fc {
+class AgentServer;
 class Window : public QMainWindow {
   public:
     explicit Window(bool smoke = false);
     ~Window() override;
     int smokeTest(const QString& screenshot);
+    bool openProjectPath(const QString& path, QString& error);
 
   protected:
     void closeEvent(QCloseEvent*) override;
 
   private:
-    Project project = demoProject();
+    Project project = showcaseProject();
+    AgentServer* agentServer = nullptr;
     AudioEngine audio;
     Supervisor supervisor;
     QString projectPath, autosavePath;
@@ -90,5 +93,8 @@ class Window : public QMainWindow {
     void resizePhrase(int bars);
     void requestSeek(double bar);
     void applyQueuedSeek();
+    QJsonObject handleAgentRequest(const QJsonObject& request);
+    void adoptProject(Project replacement, const QString& path = {}, bool showcasePreview = false);
+    void selectShowcasePreview();
 };
 } // namespace fc
