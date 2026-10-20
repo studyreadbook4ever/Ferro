@@ -496,10 +496,10 @@ NoteEditor::NoteEditor(Project& p, QWidget* parent) : QWidget(parent), project(p
     setObjectName("noteEditor");
     setFocusPolicy(Qt::StrongFocus);
     setMinimumHeight(250);
-    setToolTip("Click empty space to add a note; click an existing note to erase it. Drag from empty space "
-               "to draw, or from a note to erase. Shift-click to select without editing. Right-drag also "
-               "erases individual notes. Stack pitches in the same step to make chords. Mouse wheel "
-               "shifts the pitch range.");
+    setToolTip("Click empty space to add a note; click an existing note to request deletion. Drag from "
+               "empty space to draw, or from a note to mark notes for deletion. Release to confirm once "
+               "for the gesture. Shift-click to select without editing. Right-drag also marks notes for "
+               "deletion. Stack pitches in the same step to make chords. Mouse wheel shifts the pitch range.");
     refresh();
 }
 Pattern* NoteEditor::phrase() {
@@ -517,6 +517,33 @@ Note* NoteEditor::selectedNote() {
         std::find_if(notes.begin(), notes.end(), [this](const Note& n) { return n.note == selectedPitch; });
     return found == notes.end() ? nullptr : &*found;
 }
+bool NoteEditor::moveSelectedNote(int targetStep) {
+    drawing = deleting = false;
+    pendingErase.clear();
+    lastStep = lastNote = -1;
+    update();
+    auto* p = phrase();
+    const auto* selected = selectedNote();
+    if (!p || !selected || targetStep < 0 || targetStep >= int(p->steps.size()) || targetStep == step)
+        return false;
+    auto& destination = p->steps[targetStep].notes;
+    if (std::any_of(destination.begin(), destination.end(),
+                    [this](const Note& note) { return note.note == selectedPitch; }))
+        return false;
+    auto& source = p->steps[step].notes;
+    const auto from = std::find_if(source.begin(), source.end(),
+                                   [this](const Note& note) { return note.note == selectedPitch; });
+    destination.push_back(*selected);
+    source.erase(from);
+    step = targetStep;
+    drawing = deleting = changed = false;
+    pendingErase.clear();
+    lastStep = lastNote = -1;
+    if (edited)
+        edited(true);
+    update();
+    return true;
+}
 int NoteEditor::defaultNote() const {
     constexpr int roots[] = {36, 36, 60, 60, 60, 72};
     if (track < 0 || track >= TrackCount)
@@ -526,6 +553,10 @@ int NoteEditor::defaultNote() const {
 }
 void NoteEditor::select(int t, int p) {
     bool different = track != t || pattern != p;
+    if (different) {
+        drawing = deleting = false;
+        pendingErase.clear();
+    }
     track = t;
     pattern = p;
     step = 0;
@@ -603,8 +634,13 @@ void NoteEditor::paintEvent(QPaintEvent*) {
             QColor color = colors[track];
             color.setAlpha(100 + int(note.velocity * 150));
             p.setBrush(color);
-            p.setPen(int(s) == step && note.note == selectedPitch ? QColor("#f1dfb9") : QColor("#8da58f"));
+            const bool erasePreview = pendingErase.count({int(s), note.note}) != 0;
+            p.setPen(erasePreview ? QColor("#ff897b")
+                                 : int(s) == step && note.note == selectedPitch ? QColor("#f1dfb9")
+                                                                               : QColor("#8da58f"));
             p.drawRoundedRect(box, 2, 2);
+            if (erasePreview)
+                p.drawLine(box.topLeft(), box.bottomRight());
         }
     if (playStep >= 0) {
         p.setPen(QPen(QColor("#d7c49a"), 1));
@@ -615,6 +651,8 @@ void NoteEditor::paintEvent(QPaintEvent*) {
 void NoteEditor::drawAt(QPoint pos, bool press, bool selectOnly) {
     auto* p = phrase();
     if (!p || pos.x() < 64 || pos.y() < 24)
+        return;
+    if (drawing && (track != gestureTrack || pattern != gesturePattern))
         return;
     int s = int((pos.x() - 64) / ((width() - 64.) / p->steps.size())),
         n = baseNote + 23 - int((pos.y() - 24) / ((height() - 24.) / 24));
@@ -634,10 +672,8 @@ void NoteEditor::drawAt(QPoint pos, bool press, bool selectOnly) {
     if (selectOnly) {
         // Selection leaves both audible notes and legacy silent placeholders unchanged.
     } else if (deleting) {
-        if (found != notes.end()) {
-            notes.erase(found);
-            modified = true;
-        }
+        if (found != notes.end())
+            pendingErase.insert({s, n});
     } else if (found == notes.end()) {
         notes.push_back({100. / 127, n});
         modified = true;
@@ -658,6 +694,9 @@ void NoteEditor::mousePressEvent(QMouseEvent* e) {
     drawing = !selectOnly;
     deleting = e->button() == Qt::RightButton;
     changed = false;
+    gestureTrack = track;
+    gesturePattern = pattern;
+    pendingErase.clear();
     lastStep = lastNote = -1;
     drawAt(e->position().toPoint(), true, selectOnly);
 }
@@ -667,9 +706,50 @@ void NoteEditor::mouseMoveEvent(QMouseEvent* e) {
 }
 void NoteEditor::mouseReleaseEvent(QMouseEvent*) {
     drawing = false;
-    if (edited)
-        edited(changed);
+    deleting = false;
+    bool modified = changed;
     changed = false;
+    const int eraseTrack = gestureTrack, erasePattern = gesturePattern;
+    auto candidates = std::move(pendingErase);
+    pendingErase.clear();
+    lastStep = lastNote = -1;
+    update();
+    auto* p = phrase();
+    if (p && track == eraseTrack && pattern == erasePattern && !candidates.empty()) {
+        for (auto it = candidates.begin(); it != candidates.end();) {
+            const auto [position, pitch] = *it;
+            if (position < 0 || position >= int(p->steps.size()) ||
+                std::none_of(p->steps[position].notes.begin(), p->steps[position].notes.end(),
+                             [pitch](const Note& note) { return note.note == pitch; }))
+                it = candidates.erase(it);
+            else
+                ++it;
+        }
+        if (!candidates.empty() && confirmErase) {
+            // The dialog runs a nested event loop. Keep no pointers across it,
+            // and never apply a stale confirmation to a changed project.
+            const auto beforeConfirmation = projectToJson(project);
+            p = nullptr;
+            const bool confirmed = confirmErase(int(candidates.size()));
+            if (confirmed && track == eraseTrack && pattern == erasePattern &&
+                projectToJson(project) == beforeConfirmation) {
+                p = phrase();
+                if (p)
+                    for (const auto& [position, pitch] : candidates) {
+                        auto& notes = p->steps[position].notes;
+                        const auto found = std::find_if(notes.begin(), notes.end(),
+                                                         [pitch](const Note& note) { return note.note == pitch; });
+                        if (found != notes.end()) {
+                            notes.erase(found);
+                            modified = true;
+                        }
+                    }
+            }
+        }
+    }
+    if (edited)
+        edited(modified);
+    update();
 }
 void NoteEditor::wheelEvent(QWheelEvent* e) {
     baseNote = std::clamp(baseNote + (e->angleDelta().y() > 0 ? 1 : -1), 0, 104);

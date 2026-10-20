@@ -2,6 +2,8 @@
 #include "project.h"
 #include <QWidget>
 #include <functional>
+#include <set>
+#include <utility>
 
 class QTimer;
 
@@ -57,11 +59,13 @@ class NoteEditor : public QWidget {
     int track = -1, pattern = -1, step = 0, selectedPitch = -1, baseNote = 48;
     double playStep = -1;
     std::function<void(bool)> edited;
+    std::function<bool(int)> confirmErase;
     void select(int track, int pattern);
     void refresh();
     void fitNotes();
     Pattern* phrase();
     Note* selectedNote();
+    bool moveSelectedNote(int targetStep);
     int defaultNote() const;
 
   protected:
@@ -75,6 +79,8 @@ class NoteEditor : public QWidget {
     Project& project;
     bool drawing = false, deleting = false, changed = false;
     int lastStep = -1, lastNote = -1;
+    int gestureTrack = -1, gesturePattern = -1;
+    std::set<std::pair<int, int>> pendingErase;
     void drawAt(QPoint, bool press = false, bool selectOnly = false);
 };
 } // namespace fc

@@ -3,6 +3,7 @@
 #include <QString>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace fc {
@@ -12,9 +13,13 @@ constexpr int Steps = 16;
 constexpr int MaxNotesPerStep = 128;
 constexpr int MaxSongBars = 256;
 constexpr double MaxSongSeconds = 600.0;
+struct NoteOverrides {
+    std::optional<double> level, pan, tone, decay, drive;
+};
 struct Note {
     double velocity = 0.0;
     int note = 60;
+    NoteOverrides overrides{};
 };
 struct Step {
     std::vector<Note> notes;
@@ -41,6 +46,10 @@ struct Track {
     std::vector<Pattern> patterns;
     std::vector<Clip> clips;
 };
+struct SoundSettings {
+    double level, pan, tone, decay, drive;
+};
+SoundSettings resolvedNoteSettings(const Track& track, const Note& note);
 struct Project {
     QString title = "Untitled song";
     double bpm = 120.0, master = 0.7, delay = 0.15, duck = 0.35;

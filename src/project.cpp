@@ -31,7 +31,36 @@ bool integer(const QJsonObject& o, const char* key, int low, int high, int& dest
     dest = int(value);
     return true;
 }
-bool readSteps(const QJsonArray& source, std::vector<Step>& steps, int count, bool chords = false) {
+bool readOverrides(const QJsonObject& source, NoteOverrides& overrides) {
+    for (auto it = source.begin(); it != source.end(); ++it) {
+        std::optional<double>* target = nullptr;
+        double low = 0, high = 1;
+        if (it.key() == "level") {
+            target = &overrides.level;
+            high = 1.5;
+        } else if (it.key() == "pan") {
+            target = &overrides.pan;
+            low = -1;
+        } else if (it.key() == "tone") {
+            target = &overrides.tone;
+        } else if (it.key() == "decay") {
+            target = &overrides.decay;
+        } else if (it.key() == "drive") {
+            target = &overrides.drive;
+        } else {
+            return false;
+        }
+        if (!it.value().isDouble())
+            return false;
+        const double value = it.value().toDouble();
+        if (!std::isfinite(value) || value < low || value > high)
+            return false;
+        *target = value;
+    }
+    return true;
+}
+bool readSteps(const QJsonArray& source, std::vector<Step>& steps, int count, bool chords = false,
+               bool allowOverrides = false) {
     if (source.size() != count)
         return false;
     steps.assign(count, {});
@@ -50,6 +79,10 @@ bool readSteps(const QJsonArray& source, std::vector<Step>& steps, int count, bo
             if (!number(obj, "velocity", 0, 1, note.velocity) ||
                 !integer(obj, "note", 0, 127, note.note) || !pitches.insert(note.note).second)
                 return false;
+            if (obj.contains("overrides") &&
+                (!allowOverrides || !obj.value("overrides").isObject() ||
+                 !readOverrides(obj.value("overrides").toObject(), note.overrides)))
+                return false;
             steps[s].notes.push_back(note);
         }
     }
@@ -66,6 +99,11 @@ uint64_t eventIdentity(int track, uint64_t clip, int step, int voice = 0) {
 }
 } // namespace
 
+SoundSettings resolvedNoteSettings(const Track& track, const Note& note) {
+    const auto& o = note.overrides;
+    return {o.level.value_or(track.volume), o.pan.value_or(track.pan), o.tone.value_or(track.tone),
+            o.decay.value_or(track.decay), o.drive.value_or(track.drive)};
+}
 int songFrames(const Project& p) { return frameAtStep(p, p.songBars * Steps); }
 int renderFrames(const Project& p) { return songFrames(p) + int(std::llround(p.tailSeconds * SampleRate)); }
 int loopFrames(const Project& p) { return renderFrames(p); }
@@ -213,8 +251,22 @@ QJsonObject projectToJson(const Project& p) {
             QJsonArray steps;
             for (const auto& s : pattern.steps) {
                 QJsonArray notes;
-                for (const auto& note : s.notes)
-                    notes.append(QJsonObject{{"velocity", note.velocity}, {"note", note.note}});
+                for (const auto& note : s.notes) {
+                    QJsonObject obj{{"velocity", note.velocity}, {"note", note.note}};
+                    QJsonObject overrides;
+                    const auto add = [&](const char* key, const std::optional<double>& value) {
+                        if (value)
+                            overrides.insert(key, *value);
+                    };
+                    add("level", note.overrides.level);
+                    add("pan", note.overrides.pan);
+                    add("tone", note.overrides.tone);
+                    add("decay", note.overrides.decay);
+                    add("drive", note.overrides.drive);
+                    if (!overrides.isEmpty())
+                        obj.insert("overrides", overrides);
+                    notes.append(obj);
+                }
                 steps.append(notes);
             }
             patterns.append(QJsonObject{{"name", pattern.name}, {"bars", pattern.bars}, {"steps", steps}});
@@ -227,14 +279,14 @@ QJsonObject projectToJson(const Project& p) {
                                   {"mute", t.mute}, {"solo", t.solo}, {"sample", t.samplePath},
                                   {"patterns", patterns}, {"clips", clips}});
     }
-    return {{"format", "ferro-project"}, {"version", 3}, {"title", p.title}, {"bpm", p.bpm},
+    return {{"format", "ferro-project"}, {"version", 4}, {"title", p.title}, {"bpm", p.bpm},
             {"master", p.master}, {"delay", p.delay}, {"duck", p.duck}, {"metronome", p.metronome},
             {"songBars", p.songBars}, {"tailSeconds", p.tailSeconds}, {"tracks", tracks}};
 }
 bool projectFromJson(const QJsonObject& o, Project& out, QString& error) {
     auto fail = [&](const QString& message) { error = message; return false; };
     int version = 0;
-    if (o.value("format") != "ferro-project" || !integer(o, "version", 1, 3, version))
+    if (o.value("format") != "ferro-project" || !integer(o, "version", 1, 4, version))
         return fail("Unsupported project format/version.");
     Project p;
     if (!o.value("title").isString() || o.value("title").toString().size() > 256)
@@ -312,8 +364,10 @@ bool projectFromJson(const QJsonObject& o, Project& out, QString& error) {
                     return fail("Phrase names must fit 80 characters and phrase lengths must be 1–16 bars.");
                 pattern.name = source.value("name").toString();
                 if (!source.value("steps").isArray() ||
-                    !readSteps(source.value("steps").toArray(), pattern.steps, pattern.bars * Steps, version >= 3))
-                    return fail("Invalid phrase steps: expected unique MIDI notes (0–127) with velocity 0–1.");
+                    !readSteps(source.value("steps").toArray(), pattern.steps, pattern.bars * Steps,
+                               version >= 3, version >= 4))
+                    return fail("Invalid phrase steps: expected unique MIDI notes (0–127), velocity 0–1, "
+                                "and valid note sound overrides.");
             }
             t.patterns.push_back(std::move(pattern));
         }

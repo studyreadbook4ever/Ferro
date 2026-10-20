@@ -17,6 +17,7 @@ class QPlainTextEdit;
 class QCheckBox;
 class QComboBox;
 class QScrollArea;
+class QAction;
 namespace fc {
 class Window : public QMainWindow {
   public:
@@ -56,9 +57,15 @@ class Window : public QMainWindow {
     QSlider *volume = nullptr, *pan = nullptr, *tone = nullptr, *decay = nullptr, *drive = nullptr,
             *master = nullptr, *delay = nullptr, *duck = nullptr, *zoom = nullptr;
     QCheckBox *click = nullptr, *loop = nullptr;
+    std::array<QCheckBox*, 5> noteSoundOverride{};
+    std::array<QSpinBox*, 5> noteSoundValue{};
+    QPushButton* noteSoundReset = nullptr;
+    QPushButton* moveNoteButton = nullptr;
+    QAction* moveNoteAction = nullptr;
     void build();
     void change();
     void refreshSelection();
+    void refreshNoteSound();
     void refreshProject();
     void tick();
     void togglePlay();
@@ -68,8 +75,11 @@ class Window : public QMainWindow {
     void newSession(bool demo);
     void exportWave();
     bool confirmDiscard();
+    bool confirmNoteDeletion(int count, const QString& reason);
+    void moveNote();
     void report(const QString& message);
     void importSample();
+    bool applySample(const QString& path);
     void resetHistory();
     void undo(int delta);
     void recoverSession(Project recovered);

@@ -30,8 +30,7 @@ double bounded(double x, double lo, double hi) {
 }
 
 int checkedFrames(const Project& p) {
-    if (!std::isfinite(p.bpm) || p.bpm < 40 || p.bpm > 300 || p.songBars < 1 ||
-        p.songBars > MaxSongBars)
+    if (!std::isfinite(p.bpm) || p.bpm < 40 || p.bpm > 300 || p.songBars < 1 || p.songBars > MaxSongBars)
         throw std::runtime_error("Tempo must be 40–300 BPM and the song must have 1–256 bars.");
     if (!std::isfinite(p.tailSeconds) || p.tailSeconds < 0 || p.tailSeconds > 8)
         throw std::runtime_error("The effect tail must be between 0 and 8 seconds.");
@@ -137,7 +136,7 @@ struct Voice {
     Biquad anti1, anti2, hp, lp, body;
     ResonantFilter filter;
     int type;
-    Voice(int track, const Track& t, int note, uint32_t seed)
+    Voice(int track, const SoundSettings& t, int note, uint32_t seed)
         : tone(bounded(t.tone, 0, 1)), decay(bounded(t.decay, 0, 1)), drive(bounded(t.drive, 0, 1)),
           hz(frequency(note)), duration(0), noise(seed), type(track) {
         if (type == 0)
@@ -392,8 +391,6 @@ std::vector<float> renderTrack(const Project& project, int trackIndex) {
     const Track& track = project.tracks[trackIndex];
     if (track.instrument < 0 || track.instrument >= TrackCount)
         throw std::runtime_error("Invalid instrument type.");
-    const double volume = bounded(track.volume, 0, 1.5), pan = bounded(track.pan, -1, 1);
-    const double left = std::sqrt(1.0 - pan), right = std::sqrt(1.0 + pan);
     std::vector<float> output(static_cast<size_t>(frames) * 2, 0);
     std::unique_ptr<Sample> sample;
     std::map<int, std::vector<float>> pitched;
@@ -424,6 +421,9 @@ std::vector<float> renderTrack(const Project& project, int trackIndex) {
     }
     size_t cacheBytes = 0;
     events(project, trackIndex, [&](int onset, const Note& event, uint64_t eventId) {
+        const auto sound = resolvedNoteSettings(track, event);
+        const double volume = bounded(sound.level, 0, 1.5), pan = bounded(sound.pan, -1, 1);
+        const double left = std::sqrt(1.0 - pan), right = std::sqrt(1.0 + pan);
         const double level = event.velocity * volume;
         if (sample) {
             auto existing = pitched.find(event.note);
@@ -438,13 +438,13 @@ std::vector<float> renderTrack(const Project& project, int trackIndex) {
                 existing = pitched.emplace(event.note, std::move(audio)).first;
             }
             const auto& audio = existing->second;
-            const double decay = bounded(track.decay, 0, 1), drive = bounded(track.drive, 0, 1);
+            const double decay = bounded(sound.decay, 0, 1), drive = bounded(sound.drive, 0, 1);
             // Sample envelopes preserve the imported sound at long decay; short
             // settings make a tight one-shot without modifying the source file.
             const double release = .045 + decay * decay * 8;
             const double gain = 1.0 + drive * 2;
             Biquad leftFilter, rightFilter;
-            const double cutoff = 900 + bounded(track.tone, 0, 1) * 18100;
+            const double cutoff = 900 + bounded(sound.tone, 0, 1) * 18100;
             leftFilter.lowpass(cutoff, SampleRate);
             rightFilter.lowpass(cutoff, SampleRate);
             const size_t length = std::min(audio.size() / 2, static_cast<size_t>(frames - onset));
@@ -457,7 +457,7 @@ std::vector<float> renderTrack(const Project& project, int trackIndex) {
                 output[destination * 2 + 1] += static_cast<float>(b * level * right * envelope);
             }
         } else {
-            Voice voice(track.instrument, track, event.note,
+            Voice voice(track.instrument, sound, event.note,
                         0xa341316cu ^ static_cast<uint32_t>(eventId * 747796405u + trackIndex * 2891336453u));
             const int duration = static_cast<int>(std::ceil(voice.duration * SampleRate));
             for (int i = 0; i < std::min(duration, frames - onset); ++i) {
@@ -476,12 +476,14 @@ std::vector<float> renderTrack(const Project& project, int trackIndex) {
             if (kick.instrument != 0 || !audible(project, kickTrack))
                 continue;
             events(project, kickTrack, [&](int onset, const Note& event, uint64_t) {
-                const double release = .035 + bounded(kick.decay, 0, 1) * .10;
+                const auto sound = resolvedNoteSettings(kick, event);
+                const double release = .035 + bounded(sound.decay, 0, 1) * .10;
                 const int duration = static_cast<int>(release * 7 * SampleRate);
-                const double strength = amount * .96 * event.velocity * bounded(kick.volume, 0, 1);
+                const double strength = amount * .96 * event.velocity * bounded(sound.level, 0, 1);
                 for (int i = 0; i < std::min(duration, frames - onset); ++i) {
                     const size_t destination = static_cast<size_t>(onset + i);
-                    const float gain = static_cast<float>(1 - strength * std::exp(-i / (release * SampleRate)));
+                    const float gain =
+                        static_cast<float>(1 - strength * std::exp(-i / (release * SampleRate)));
                     duck[destination] = std::min(duck[destination], gain);
                 }
             });

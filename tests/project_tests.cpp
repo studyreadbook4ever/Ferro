@@ -66,6 +66,19 @@ QJsonObject withFirstStep(QJsonObject project, const QJsonValue& value) {
     project["tracks"] = tracks;
     return project;
 }
+bool hasNoOverrides(const fc::Note& note) {
+    const auto& o = note.overrides;
+    return !o.level && !o.pan && !o.tone && !o.decay && !o.drive;
+}
+bool hasNoOverrides(const fc::Project& project) {
+    for (const auto& track : project.tracks)
+        for (const auto& pattern : track.patterns)
+            for (const auto& step : pattern.steps)
+                for (const auto& note : step.notes)
+                    if (!hasNoOverrides(note))
+                        return false;
+    return true;
+}
 }
 int projectTests() {
     int failures = 0;
@@ -79,8 +92,9 @@ int projectTests() {
     QString error;
     auto json = fc::projectToJson(p);
     check(fc::projectFromJson(json, out, error), "valid demo roundtrip");
-    check(json["version"].toInt() == 3, "writes polyphonic song format v3");
+    check(json["version"].toInt() == 4, "writes note sound override format v4");
     check(fc::projectToJson(out) == json, "roundtrip preserves every field");
+    check(hasNoOverrides(out), "default song notes inherit every track sound control");
     auto blank = fc::emptyProject();
     check(blank.bpm == 120 && blank.songBars == 16 && blank.tailSeconds == 2, "neutral default song");
     bool empty = true;
@@ -91,6 +105,7 @@ int projectTests() {
     auto reject = [&](QJsonObject bad, const char* reason) {
         out = p;
         out.title = "unchanged";
+        out.tracks[0].patterns[0].steps[0].notes[0].overrides.pan = -.8;
         const auto original = fc::projectToJson(out);
         check(!fc::projectFromJson(bad, out, error), reason);
         check(fc::projectToJson(out) == original && !error.isEmpty(),
@@ -165,7 +180,7 @@ int projectTests() {
     check(fc::projectToJson(out) == chordJson, "chord pitches, order, and independent velocities roundtrip");
     check(fc::projectFromJson(withFirstStep(json, QJsonArray{}), out, error) &&
           out.tracks[0].patterns[0].steps[0].notes.empty(), "empty note array represents a rest");
-    reject(withFirstStep(json, c), "v3 requires a note array instead of a legacy step object");
+    reject(withFirstStep(json, c), "v4 requires a note array instead of a legacy step object");
     reject(withFirstStep(json, QJsonValue::Null), "null chord rejected");
     reject(withFirstStep(json, QJsonArray{c, 64}), "nonobject chord member rejected");
     reject(withFirstStep(json, QJsonArray{c, QJsonObject{{"note", 64}}}), "missing chord velocity rejected");
@@ -188,6 +203,79 @@ int projectTests() {
           "all 128 MIDI pitches fit in a single chord");
     allPitches.append(c);
     reject(withFirstStep(json, allPitches), "more than 128 chord notes rejected");
+
+    auto overriddenC = c, overriddenE = e;
+    overriddenC["overrides"] = QJsonObject{{"level", 0}, {"pan", -1}, {"tone", .7}};
+    overriddenE["overrides"] = QJsonObject{{"pan", 1}, {"decay", 1}, {"drive", 0}};
+    const auto soundJson = withFirstStep(json, QJsonArray{overriddenC, overriddenE, g});
+    check(fc::projectFromJson(soundJson, out, error), "mixed chord with partial note sound overrides loads");
+    check(fc::projectToJson(out) == soundJson, "sparse overrides and explicit zero roundtrip exactly");
+    const auto& soundNotes = out.tracks[0].patterns[0].steps[0].notes;
+    check(soundNotes.size() == 3 && soundNotes[0].overrides.level == 0 &&
+          !soundNotes[0].overrides.decay && soundNotes[1].overrides.drive == 0 &&
+          hasNoOverrides(soundNotes[2]), "unset controls remain distinguishable from explicit zero");
+    auto withOverrides = [&](QJsonValue value) {
+        auto note = c;
+        note["overrides"] = value;
+        return withFirstStep(json, QJsonArray{note, e, g});
+    };
+    check(fc::projectFromJson(withOverrides(QJsonObject{}), out, error) &&
+          fc::projectToJson(out) == chordJson, "empty override objects normalize to inherited settings");
+    check(fc::projectFromJson(withOverrides(QJsonObject{{"level", 1.5}, {"pan", 1}, {"tone", 1},
+                                                       {"decay", 1}, {"drive", 1}}), out, error),
+          "upper bounds of every note sound control accepted");
+    auto zeroJson = withOverrides(QJsonObject{{"level", 0}, {"pan", 0}, {"tone", 0},
+                                              {"decay", 0}, {"drive", 0}});
+    check(fc::projectFromJson(zeroJson, out, error) && fc::projectToJson(out) == zeroJson,
+          "all explicit zero overrides remain stored rather than reverting to track values");
+    reject(withOverrides(QJsonValue::Null), "null overrides rejected");
+    reject(withOverrides(QJsonArray{}), "array overrides rejected");
+    reject(withOverrides("inherit"), "string overrides rejected");
+    reject(withOverrides(QJsonObject{{"volume", .5}}), "unknown note sound control rejected");
+    reject(withOverrides(QJsonObject{{"level", .5}, {"unsupported", 0}}), "unknown sibling control rejected");
+    for (const char* key : {"level", "pan", "tone", "decay", "drive"}) {
+        const bool panControl = QString::fromLatin1(key) == "pan";
+        const bool levelControl = QString::fromLatin1(key) == "level";
+        reject(withOverrides(QJsonObject{{key, panControl ? -1.01 : -.01}}), "override below its range rejected");
+        reject(withOverrides(QJsonObject{{key, levelControl ? 1.51 : 1.01}}), "override above its range rejected");
+        reject(withOverrides(QJsonObject{{key, QJsonValue::Null}}), "null override value rejected");
+        reject(withOverrides(QJsonObject{{key, true}}), "boolean override value rejected");
+        reject(withOverrides(QJsonObject{{key, "0.5"}}), "string override value rejected");
+    }
+    invalidPattern = p;
+    invalidPattern.tracks[0].patterns[0].steps[0].notes[0].overrides.tone =
+        std::numeric_limits<double>::quiet_NaN();
+    reject(fc::projectToJson(invalidPattern), "nonfinite note override rejected");
+
+    fc::Track soundTrack;
+    soundTrack.volume = .8;
+    soundTrack.pan = -.3;
+    soundTrack.tone = .4;
+    soundTrack.decay = .5;
+    soundTrack.drive = .6;
+    fc::Note soundNote{.2, 60};
+    auto resolved = fc::resolvedNoteSettings(soundTrack, soundNote);
+    check(resolved.level == .8 && resolved.pan == -.3 && resolved.tone == .4 &&
+          resolved.decay == .5 && resolved.drive == .6, "unset note controls resolve to track values");
+    soundNote.overrides = {1.2, 0, 0, 1, .2};
+    resolved = fc::resolvedNoteSettings(soundTrack, soundNote);
+    check(resolved.level == 1.2 && resolved.pan == 0 && resolved.tone == 0 &&
+          resolved.decay == 1 && resolved.drive == .2,
+          "overrides replace controls absolutely and resolution does not apply velocity");
+    soundNote.overrides = {0, -.8, std::nullopt, std::nullopt, std::nullopt};
+    soundTrack.volume = .3;
+    soundTrack.pan = .7;
+    soundTrack.tone = .9;
+    soundTrack.decay = .2;
+    soundTrack.drive = .1;
+    resolved = fc::resolvedNoteSettings(soundTrack, soundNote);
+    check(resolved.level == 0 && resolved.pan == -.8 && resolved.tone == .9 &&
+          resolved.decay == .2 && resolved.drive == .1,
+          "track edits affect inherited controls while fixed values and zero remain unchanged");
+    soundNote.overrides = {};
+    resolved = fc::resolvedNoteSettings(soundTrack, soundNote);
+    check(resolved.level == .3 && resolved.pan == .7 && resolved.tone == .9 &&
+          resolved.decay == .2 && resolved.drive == .1, "clearing overrides restores current track settings");
 
     auto boundary = blank;
     boundary.bpm = 40;
@@ -251,6 +339,7 @@ int projectTests() {
     auto chordSchedule = schedule;
     auto& chordSteps = chordSchedule.tracks[0].patterns[0].steps;
     chordSteps[0].notes = {{.9, 60}, {.7, 64}, {.6, 67}, {0, 90}};
+    chordSteps[0].notes[1].overrides = {.4, -.6, .2, .8, 0};
     chordSteps[15].notes = {{.5, 64}, {.4, 69}};
     chordSteps[16].notes = {{.8, 67}, {.6, 71}};
     chordSteps[31].notes = {{.4, 72}, {.3, 76}, {.2, 79}};
@@ -283,10 +372,31 @@ int projectTests() {
             if (event.frame == original.frame && event.step.note == original.step.note)
                 stableChordIds &= event.eventId == original.eventId;
     check(stableChordIds, "additional chord identities follow pitches when their storage order changes");
+    int scheduledOverrides = 0;
+    for (const auto& event : chordEvents)
+        if (event.step.overrides.level) {
+            const auto& o = event.step.overrides;
+            check(event.step.note == 64 && o.level == .4 && o.pan == -.6 && o.tone == .2 &&
+                  o.decay == .8 && o.drive == 0, "scheduler copies every override onto its own chord voice");
+            ++scheduledOverrides;
+        }
+    check(scheduledOverrides == 3, "note overrides survive phrase repetition and clipped source repeats");
+
+    auto versionThree = chordJson;
+    versionThree["version"] = 3;
+    check(fc::projectFromJson(versionThree, out, error) && hasNoOverrides(out) &&
+          fc::projectToJson(out) == chordJson, "v3 chords migrate unchanged with inherited track controls");
+    auto oldOverrides = soundJson;
+    oldOverrides["version"] = 3;
+    reject(oldOverrides, "v3 cannot silently interpret v4 sound overrides");
+    oldOverrides = withOverrides(QJsonObject{});
+    oldOverrides["version"] = 3;
+    reject(oldOverrides, "even empty overrides are rejected in old schemas");
 
     const auto versionTwo = versionTwoFixture(json);
     fc::Project importedTwo;
     check(fc::projectFromJson(versionTwo, importedTwo, error), "version2 monophonic song migrates");
+    check(hasNoOverrides(importedTwo), "every v2 note inherits track controls after migration");
     bool versionTwoNotes = true, versionTwoEvents = true;
     for (int t = 0; t < fc::TrackCount; ++t) {
         const auto oldPatterns = versionTwo["tracks"].toArray()[t].toObject()["patterns"].toArray();
@@ -309,14 +419,16 @@ int projectTests() {
     check(versionTwoNotes, "v2 migration preserves active notes and stored pitches of zero-velocity rests");
     check(versionTwoEvents, "v2 migration preserves every audible onset, velocity, and noise identity");
     check(fc::projectFromJson(fc::projectToJson(importedTwo), out, error) &&
-          fc::projectToJson(out) == fc::projectToJson(importedTwo), "v2 migration saves and reloads as v3");
+          fc::projectToJson(out) == fc::projectToJson(importedTwo), "v2 migration saves and reloads as v4");
     reject(withFirstStep(versionTwo, QJsonArray{c, e, g}), "v2 does not silently accept v3 chords");
     reject(withFirstStep(versionTwo, QJsonObject{{"velocity", .5}, {"note", 60.5}}),
            "v2 legacy notes remain strictly validated");
+    reject(withFirstStep(versionTwo, overriddenC), "v2 rejects note sound overrides");
 
     const auto legacy = legacyFixture();
     fc::Project imported;
     check(fc::projectFromJson(legacy, imported, error), "version1 project migrates");
+    check(hasNoOverrides(imported), "every v1 note inherits track controls after migration");
     check(imported.title == "Original title" && imported.songBars == 6 && imported.tailSeconds == 2 &&
           imported.bpm == 193.5 && imported.master == .7 && imported.delay == .2 &&
           imported.duck == .8 && imported.metronome, "legacy song metadata preserved");
@@ -351,21 +463,33 @@ int projectTests() {
     check(notesPreserved, "migration preserves every stored note and every arranged onset");
     check(controlsPreserved, "migration preserves all track controls and source paths");
     check(importedIds.size() == 24, "migrated clips use globally unique identities");
-    check(fc::projectFromJson(fc::projectToJson(imported), out, error), "migrated project validates as v3");
+    check(fc::projectFromJson(fc::projectToJson(imported), out, error), "migrated project validates as v4");
     bad = legacy;
     bad["arrangement"] = QJsonArray{1.5};
     reject(bad, "legacy fractional pattern rejected");
     bad = legacy;
     bad["bpm"] = 79;
     reject(bad, "legacy tempo still validated against original contract");
+    bad = legacy;
+    auto legacyTracks = bad["tracks"].toArray();
+    auto legacyTrack = legacyTracks[0].toObject();
+    auto legacyPatterns = legacyTrack["patterns"].toArray();
+    auto legacySteps = legacyPatterns[0].toArray();
+    legacySteps[0] = overriddenC;
+    legacyPatterns[0] = legacySteps;
+    legacyTrack["patterns"] = legacyPatterns;
+    legacyTracks[0] = legacyTrack;
+    bad["tracks"] = legacyTracks;
+    reject(bad, "v1 rejects note sound overrides");
 
     QTemporaryDir dir;
     p.tracks[0].samplePath = dir.filePath("sounds/kick.wav");
     const QString path = dir.filePath("session.ferro");
     p.tracks[2].patterns[0].steps[0].notes = {{.5, 60}, {.4, 64}, {.3, 67}};
+    p.tracks[2].patterns[0].steps[0].notes[1].overrides = {0, -.8, .3, 1, 0};
     check(fc::saveProject(path, p, error), "atomic save");
     check(fc::loadProject(path, out, error), "read saved file");
-    check(fc::projectToJson(out) == fc::projectToJson(p), "saved song restores complete chord content");
+    check(fc::projectToJson(out) == fc::projectToJson(p), "saved song restores chords and note sound overrides");
     check(out.tracks[0].samplePath == p.tracks[0].samplePath, "sample relative paths resolve correctly");
     QFile saved(path);
     check(saved.open(QIODevice::ReadOnly), "read saved JSON");
@@ -376,6 +500,11 @@ int projectTests() {
     invalidProject.title = QString(257, 'x');
     check(!fc::saveProject(path, invalidProject, error), "invalid project save rejected");
     check(fc::loadProject(path, out, error) && out.title == p.title, "rejected save preserves prior file");
+    invalidProject = p;
+    invalidProject.tracks[2].patterns[0].steps[0].notes[1].overrides.pan = 1.01;
+    check(!fc::saveProject(path, invalidProject, error), "invalid note sound override cannot be saved");
+    check(fc::loadProject(path, out, error) && fc::projectToJson(out) == fc::projectToJson(p),
+          "rejected override save preserves the previously saved song");
     QFile invalid(dir.filePath("invalid.ferro"));
     check(invalid.open(QIODevice::WriteOnly), "open corrupt fixture");
     invalid.write("{broken");

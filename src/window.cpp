@@ -1,11 +1,13 @@
 #include "window.h"
 #include "dsp.h"
+#include <QAction>
 #include <QApplication>
 #include <QBoxLayout>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QFile>
@@ -39,6 +41,12 @@
 
 namespace fc {
 namespace {
+constexpr std::array<std::optional<double> NoteOverrides::*, 5> noteOverrideFields = {
+    &NoteOverrides::level, &NoteOverrides::pan, &NoteOverrides::tone, &NoteOverrides::decay,
+    &NoteOverrides::drive};
+constexpr std::array<double SoundSettings::*, 5> noteSettingFields = {
+    &SoundSettings::level, &SoundSettings::pan, &SoundSettings::tone, &SoundSettings::decay,
+    &SoundSettings::drive};
 QPushButton* button(const QString& text, const QString& tip = {}) {
     auto* b = new QPushButton(text);
     b->setToolTip(tip);
@@ -58,19 +66,25 @@ QString timecode(uint64_t frames) {
         .arg(ms % 1000, 3, 10, QChar('0'));
 }
 bool prepareSamplePitches(Track& track) {
+    auto meaningful = [](const Note& note) {
+        return note.velocity > 0 ||
+               std::any_of(noteOverrideFields.begin(), noteOverrideFields.end(),
+                           [&note](auto field) { return (note.overrides.*field).has_value(); });
+    };
     for (const auto& pattern : track.patterns)
         for (const auto& step : pattern.steps)
-            if (std::count_if(step.notes.begin(), step.notes.end(),
-                              [](const Note& note) { return note.velocity > 0; }) > 1)
+            if (std::count_if(step.notes.begin(), step.notes.end(), meaningful) > 1)
                 return true;
     for (auto& pattern : track.patterns)
         for (auto& step : pattern.steps) {
-            auto active = std::find_if(step.notes.begin(), step.notes.end(),
-                                       [](const Note& note) { return note.velocity > 0; });
-            if (active == step.notes.end())
+            auto meaningfulNote = std::find_if(step.notes.begin(), step.notes.end(), meaningful);
+            if (meaningfulNote == step.notes.end())
                 step.notes.clear();
-            else
-                step.notes = {{active->velocity, 60}};
+            else {
+                Note retuned = *meaningfulNote;
+                retuned.note = 60;
+                step.notes = {retuned};
+            }
         }
     return false;
 }
@@ -168,6 +182,8 @@ void Window::build() {
     edit->addAction("Duplicate clip", QKeySequence("Ctrl+D"), this,
                     [this] { timeline->duplicateSelected(); });
     edit->addAction("Make clip independent", this, [this] { timeline->makeIndependent(); });
+    moveNoteAction =
+        edit->addAction("Move note…", QKeySequence("Ctrl+Shift+M"), this, [this] { moveNote(); });
     auto* engine = menuBar()->addMenu("Engine");
     engine->addAction("Reload workers", QKeySequence("Ctrl+R"), this, [this] { supervisor.reload(); });
     engine->addAction("Retry audio device", this, [this] {
@@ -206,10 +222,15 @@ void Window::build() {
             "body: move (also between tracks)\nCtrl-drag: copy a clip\nDrag clip right edge: repeat its "
             "phrase\nRight-click clip: duplicate, make independent, delete\nClick timeline ruler: seek\nDrag "
             "END marker or set Song bars: song length\n\nSelect a clip to edit notes below.\nClick empty "
-            "space: add a note. Click a note: erase it.\nDrag from empty space: draw; from a note: erase.\n"
-            "Shift-click: select without editing. Right-drag: erase individual notes.\nStack pitches in a "
+            "space: add a note. Click a note: request deletion.\nDrag from empty space: draw; from a note: "
+            "request deletion.\nShift-click: select without editing. Right-drag: request deletion.\n"
+            "Deletion asks for confirmation before removing notes and their settings.\n"
+            "Move note… / Ctrl+Shift+M: move a selected note in time, keeping all settings.\nStack pitches "
+            "in a "
             "sixteenth-note step to make chords. Scroll: change pitch "
-            "range.\nCopies on the same track share a phrase. Make independent for variations.\n\nSpace: "
+            "range.\nNOTE SOUND: check a setting to override it on the selected note; uncheck to follow "
+            "TRACK. Reset to track defaults clears all five note overrides.\n"
+            "Copies on the same track share a phrase. Make independent for variations.\n\nSpace: "
             "Play / pause   Home: Stop and rewind\nCtrl+S: Save   Ctrl+E: Export entire song once\nLoop is "
             "optional and off by default.\nExport includes the ending tail and does not use transport Loop.");
     });
@@ -420,6 +441,7 @@ void Window::build() {
             change();
         }
     };
+    editor->confirmErase = [this](int count) { return confirmNoteDeletion(count, "Erase selected notes"); };
     connect(phraseName, &QLineEdit::textEdited, this, [this](const QString& name) {
         if (auto* p = editor->phrase()) {
             p->name = name;
@@ -434,6 +456,14 @@ void Window::build() {
     connect(unique, &QPushButton::clicked, this, [this] { timeline->makeIndependent(); });
     connect(clear, &QPushButton::clicked, this, [this] {
         if (auto* p = editor->phrase()) {
+            int count = 0;
+            for (const auto& s : p->steps)
+                count += int(s.notes.size());
+            if (count == 0 || !confirmNoteDeletion(count, "Clear this phrase"))
+                return;
+            p = editor->phrase();
+            if (!p)
+                return;
             for (auto& s : p->steps)
                 s.notes.clear();
             refreshSelection();
@@ -482,6 +512,7 @@ void Window::build() {
             number->setText(QString::number(x));
             if (!updating) {
                 cb(x);
+                refreshNoteSound();
                 change();
             }
         });
@@ -555,6 +586,10 @@ void Window::build() {
     velocity->setRange(0, 127);
     velRow->addWidget(velocity);
     stepLayout->addLayout(velRow);
+    moveNoteButton = button("Move note…", "Move this note in time, keeping its pitch, velocity and sound");
+    moveNoteButton->setObjectName("moveNote");
+    stepLayout->addWidget(moveNoteButton);
+    connect(moveNoteButton, &QPushButton::clicked, this, [this] { moveNote(); });
     stepLayout->addWidget(caption("RIGHT-DRAG TO ERASE"));
     bottom->addWidget(stepBox, 1);
     connect(note, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
@@ -570,11 +605,21 @@ void Window::build() {
                     return;
                 }
                 if (selected->note != value) {
-                    notes.erase(std::remove_if(notes.begin(), notes.end(),
-                                               [value](const Note& other) {
-                                                   return other.note == value && other.velocity <= 0;
-                                               }),
-                                notes.end());
+                    const int silentCount =
+                        int(std::count_if(notes.begin(), notes.end(), [value](const Note& other) {
+                            return other.note == value && other.velocity <= 0;
+                        }));
+                    if (silentCount &&
+                        !confirmNoteDeletion(silentCount, "Replace a silent note at this pitch")) {
+                        refreshSelection();
+                        return;
+                    }
+                    auto& currentNotes = editor->phrase()->steps[editor->step].notes;
+                    currentNotes.erase(std::remove_if(currentNotes.begin(), currentNotes.end(),
+                                                      [value](const Note& other) {
+                                                          return other.note == value && other.velocity <= 0;
+                                                      }),
+                                       currentNotes.end());
                     selected = editor->selectedNote();
                 }
                 selected->note = value;
@@ -600,6 +645,62 @@ void Window::build() {
     control(ml, "BASS DUCK", duck, 0, 100, 35, [this](int x) { project.duck = x / 100.; });
     bottom->addWidget(masterBox, 1);
     root->addLayout(bottom);
+    auto* noteSoundBox = new QGroupBox("NOTE SOUND");
+    auto* noteSoundLayout = new QVBoxLayout(noteSoundBox);
+    noteSoundLayout->addWidget(caption("UNCHECKED: FOLLOW TRACK · CHECKED: OVERRIDE SELECTED NOTE"));
+    auto* noteSoundRow = new QHBoxLayout;
+    const QStringList soundNames = {"LEVEL", "PAN", "TONE", "DECAY", "DRIVE"};
+    for (size_t i = 0; i < noteSoundOverride.size(); ++i) {
+        auto* field = new QVBoxLayout;
+        auto* enabled = new QCheckBox(soundNames[int(i)]);
+        auto* value = new QSpinBox;
+        noteSoundOverride[i] = enabled;
+        noteSoundValue[i] = value;
+        enabled->setObjectName("note" + soundNames[int(i)] + "Override");
+        value->setObjectName("note" + soundNames[int(i)] + "Value");
+        enabled->setToolTip("Checked: use this value for the selected note. Unchecked: follow TRACK.");
+        value->setRange(i == 1 ? -100 : 0, i == 0 ? 150 : 100);
+        value->setSuffix("%");
+        value->setKeyboardTracking(false);
+        field->addWidget(enabled);
+        field->addWidget(value);
+        noteSoundRow->addLayout(field, 1);
+        connect(enabled, &QCheckBox::toggled, this, [this, i](bool checked) {
+            if (updating)
+                return;
+            if (auto* selected = editor->selectedNote()) {
+                auto& override = selected->overrides.*noteOverrideFields[i];
+                if (checked) {
+                    const auto effective = resolvedNoteSettings(project.tracks[editor->track], *selected);
+                    override = effective.*noteSettingFields[i];
+                } else
+                    override.reset();
+                refreshNoteSound();
+                change();
+            }
+        });
+        connect(value, qOverload<int>(&QSpinBox::valueChanged), this, [this, i](int number) {
+            if (updating)
+                return;
+            if (auto* selected = editor->selectedNote()) {
+                selected->overrides.*noteOverrideFields[i] = number / 100.;
+                refreshNoteSound();
+                change();
+            }
+        });
+    }
+    noteSoundReset = button("Reset to track defaults", "Clear all five sound overrides on the selected note");
+    noteSoundReset->setObjectName("resetNoteSound");
+    noteSoundRow->addWidget(noteSoundReset);
+    noteSoundLayout->addLayout(noteSoundRow);
+    root->addWidget(noteSoundBox);
+    connect(noteSoundReset, &QPushButton::clicked, this, [this] {
+        if (auto* selected = editor->selectedNote()) {
+            selected->overrides = {};
+            refreshNoteSound();
+            change();
+        }
+    });
     auto* enginePanel = new QWidget;
     auto* engineLayout = new QHBoxLayout(enginePanel);
     engineLayout->setContentsMargins(0, 0, 0, 0);
@@ -653,9 +754,12 @@ void Window::refreshSelection() {
     auto* selected = editor->selectedNote();
     note->setEnabled(selected);
     velocity->setEnabled(selected);
+    moveNoteButton->setEnabled(selected);
+    moveNoteAction->setEnabled(selected);
     note->setValue(selected ? selected->note : editor->defaultNote());
     noteLabel->setText(selected ? noteName(selected->note) : "—");
     velocity->setValue(selected ? int(std::round(selected->velocity * 127)) : 0);
+    refreshNoteSound();
     trackName->setText(tr.name);
     instrument->setCurrentIndex(tr.instrument);
     trackTitle->setText(tr.samplePath.isEmpty() ? "INSTRUMENT" : "SAMPLE");
@@ -672,6 +776,24 @@ void Window::refreshSelection() {
     updating = false;
     editor->refresh();
     timeline->update();
+}
+void Window::refreshNoteSound() {
+    if (!editor || !noteSoundReset)
+        return;
+    const auto* selected = editor->selectedNote();
+    const auto effective =
+        resolvedNoteSettings(project.tracks[timeline->track], selected ? *selected : Note{});
+    bool anyOverride = false;
+    for (size_t i = 0; i < noteSoundOverride.size(); ++i) {
+        const bool overridden = selected && (selected->overrides.*noteOverrideFields[i]).has_value();
+        anyOverride |= overridden;
+        const QSignalBlocker blockOverride(noteSoundOverride[i]), blockValue(noteSoundValue[i]);
+        noteSoundOverride[i]->setEnabled(selected);
+        noteSoundOverride[i]->setChecked(overridden);
+        noteSoundValue[i]->setEnabled(selected && overridden);
+        noteSoundValue[i]->setValue(int(std::round((effective.*noteSettingFields[i]) * 100)));
+    }
+    noteSoundReset->setEnabled(selected && anyOverride);
 }
 void Window::refreshProject() {
     updating = true;
@@ -697,6 +819,19 @@ void Window::resizePhrase(int bars) {
     if (!p || !clip)
         return;
     int old = p->bars;
+    if (bars < old) {
+        int removed = 0;
+        for (size_t i = size_t(bars * Steps); i < p->steps.size(); ++i)
+            removed += int(p->steps[i].notes.size());
+        if (removed && !confirmNoteDeletion(removed, "Shorten this phrase")) {
+            refreshSelection();
+            return;
+        }
+        p = editor->phrase();
+        clip = timeline->selection();
+        if (!p || !clip)
+            return;
+    }
     if (clip->lengthBars == old) {
         int end = clip->startBar + bars;
         bool room = end <= MaxSongBars && end * 240. / project.bpm + project.tailSeconds <= MaxSongSeconds;
@@ -716,6 +851,93 @@ void Window::resizePhrase(int bars) {
     editor->step = std::min(editor->step, bars * Steps - 1);
     refreshProject();
     change();
+}
+bool Window::confirmNoteDeletion(int count, const QString& reason) {
+    if (count <= 0)
+        return true;
+    const auto before = projectToJson(project);
+    const int trackBefore = timeline->track, editorTrack = editor->track, patternBefore = editor->pattern,
+              stepBefore = editor->step, pitchBefore = editor->selectedPitch;
+    const uint64_t clipBefore = timeline->selectedClip;
+    QMessageBox dialog(QMessageBox::Warning, "Delete notes?",
+                       QString("%1\n\nDelete %2 note%3 and their pitch, velocity and sound settings?\n"
+                               "Clips using the affected phrases will also change.\n"
+                               "You can undo this deletion with Ctrl+Z.")
+                           .arg(reason)
+                           .arg(count)
+                           .arg(count == 1 ? "" : "s"),
+                       QMessageBox::Discard | QMessageBox::Cancel, this);
+    dialog.setObjectName("confirmNoteDeletion");
+    dialog.button(QMessageBox::Discard)->setText("Delete notes");
+    dialog.setDefaultButton(QMessageBox::Cancel);
+    dialog.setEscapeButton(QMessageBox::Cancel);
+    if (dialog.exec() != QMessageBox::Discard)
+        return false;
+    if (projectToJson(project) != before || timeline->track != trackBefore ||
+        timeline->selectedClip != clipBefore || editor->track != editorTrack ||
+        editor->pattern != patternBefore || editor->step != stepBefore ||
+        editor->selectedPitch != pitchBefore) {
+        report("The song or selection changed. Review the notes and try deleting again.");
+        return false;
+    }
+    return true;
+}
+void Window::moveNote() {
+    const auto* selected = editor->selectedNote();
+    const auto* phrase = editor->phrase();
+    if (!selected || !phrase) {
+        report("Shift-click a note to select it before moving.");
+        return;
+    }
+    const auto before = projectToJson(project);
+    const int sourceTrack = editor->track, sourcePattern = editor->pattern, sourceStep = editor->step,
+              sourcePitch = editor->selectedPitch, timelineTrack = timeline->track;
+    const uint64_t sourceClip = timeline->selectedClip;
+    QDialog dialog(this);
+    dialog.setObjectName("moveNoteDialog");
+    dialog.setWindowTitle("Move note");
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->addWidget(new QLabel(QString("Move %1 within this phrase.\n"
+                                         "Pitch, velocity and all sound settings stay with the note.\n"
+                                         "Clips sharing this phrase follow the move.")
+                                     .arg(noteName(selected->note))));
+    auto* row = new QHBoxLayout;
+    row->addWidget(new QLabel("Bar"));
+    auto* targetBar = new QSpinBox;
+    targetBar->setObjectName("moveNoteBar");
+    targetBar->setRange(1, phrase->bars);
+    targetBar->setValue(editor->step / Steps + 1);
+    row->addWidget(targetBar);
+    row->addWidget(new QLabel("Step"));
+    auto* targetStep = new QSpinBox;
+    targetStep->setObjectName("moveNoteStep");
+    targetStep->setRange(1, Steps);
+    targetStep->setValue(editor->step % Steps + 1);
+    row->addWidget(targetStep);
+    layout->addLayout(row);
+    auto* error = new QLabel;
+    error->setObjectName("moveNoteError");
+    error->setWordWrap(true);
+    layout->addWidget(error);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Ok)->setText("Move");
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&, this] {
+        if (projectToJson(project) != before || editor->track != sourceTrack ||
+            editor->pattern != sourcePattern || editor->step != sourceStep ||
+            editor->selectedPitch != sourcePitch || timeline->track != timelineTrack ||
+            timeline->selectedClip != sourceClip) {
+            error->setText("The song or selection changed. Cancel and select the note again.");
+            return;
+        }
+        const int destination = (targetBar->value() - 1) * Steps + targetStep->value() - 1;
+        if (destination == editor->step || editor->moveSelectedNote(destination))
+            dialog.accept();
+        else
+            error->setText("That step already contains this pitch, or the note is no longer available.");
+    });
+    dialog.exec();
 }
 void Window::resetHistory() {
     history = {project};
@@ -952,16 +1174,32 @@ void Window::importSample() {
         QMessageBox::warning(this, "Sample", "Use a sample up to 16 seconds, 1–8 channels, 8–384 kHz.");
         return;
     }
+    applySample(path);
+}
+bool Window::applySample(const QString& path) {
     auto& tr = project.tracks[timeline->track];
-    tr.samplePath = path;
-    bool preservedChords = prepareSamplePitches(tr);
+    Track candidate = tr;
+    candidate.samplePath = path;
+    bool preservedChords = prepareSamplePitches(candidate);
+    int previousCount = 0, nextCount = 0;
+    for (const auto& pattern : tr.patterns)
+        for (const auto& step : pattern.steps)
+            previousCount += int(step.notes.size());
+    for (const auto& pattern : candidate.patterns)
+        for (const auto& step : pattern.steps)
+            nextCount += int(step.notes.size());
+    if (previousCount > nextCount &&
+        !confirmNoteDeletion(previousCount - nextCount, "Remove silent notes while retuning this sample"))
+        return false;
+    project.tracks[timeline->track] = std::move(candidate);
     if (!preservedChords && editor->selectedPitch >= 0)
         editor->selectedPitch = 60;
     editor->fitNotes();
     refreshSelection();
     change();
     if (preservedChords)
-        report("Sample loaded; chord pitches preserved (sample root C4).");
+        report("Sample loaded; existing note pitches preserved (sample root C4).");
+    return true;
 }
 void Window::exportWave() {
     if (exportBusy) {
@@ -1023,6 +1261,25 @@ int Window::smokeTest(const QString& screenshot) {
             ++failures;
         }
     };
+    std::vector<bool> deletionAnswers;
+    size_t nextDeletionAnswer = 0;
+    int deletionDialogs = 0;
+    QTimer deletionResponder;
+    connect(&deletionResponder, &QTimer::timeout, this, [&] {
+        auto* dialog = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+        if (!dialog || dialog->objectName() != "confirmNoteDeletion")
+            return;
+        ++deletionDialogs;
+        check(dialog->defaultButton() == dialog->button(QMessageBox::Cancel),
+              "note deletion defaults to Cancel");
+        check(nextDeletionAnswer < deletionAnswers.size(),
+              "every note deletion displays its expected warning");
+        const bool accepted =
+            nextDeletionAnswer < deletionAnswers.size() ? deletionAnswers[nextDeletionAnswer++] : false;
+        dialog->button(accepted ? QMessageBox::Discard : QMessageBox::Cancel)->click();
+    });
+    deletionResponder.start(5);
+    auto answerDeletion = [&](bool accepted) { deletionAnswers.push_back(accepted); };
     show();
     project = emptyProject();
     project.songBars = 8;
@@ -1048,6 +1305,9 @@ int Window::smokeTest(const QString& screenshot) {
         return found == notes.end() ? nullptr : &*found;
     };
     check(!note->isEnabled() && !velocity->isEnabled(), "empty step has no selected note to edit");
+    check(!noteSoundOverride[0]->isEnabled() && !noteSoundValue[0]->isEnabled() &&
+              !noteSoundReset->isEnabled(),
+          "note sound controls are disabled without a selected note");
     QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(64));
     check(voice(64) && voice(64)->velocity > 0, "draw note in clip");
     QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(60));
@@ -1055,6 +1315,12 @@ int Window::smokeTest(const QString& screenshot) {
     check(editor->phrase()->steps[0].notes.size() == 3 && voice(60) && voice(64) && voice(67),
           "stack three simultaneous pitches without replacing notes");
     const auto fullChord = projectToJson(project);
+    const int beforeDeleteHistory = historyIndex;
+    answerDeletion(false);
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(64));
+    check(projectToJson(project) == fullChord && historyIndex == beforeDeleteHistory,
+          "canceling a click deletion preserves the entire project and history");
+    answerDeletion(true);
     QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(64));
     check(!voice(64) && voice(60) && voice(67) && editor->phrase()->steps[0].notes.size() == 2 &&
               !note->isEnabled() && !velocity->isEnabled(),
@@ -1073,10 +1339,68 @@ int Window::smokeTest(const QString& screenshot) {
     QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(64));
     check(editor->selectedPitch == 64 && note->value() == 64 && projectToJson(project) == beforeSelection,
           "shift-click selects a chord tone without editing");
+    auto inheritsSound = [](const Note* n) {
+        return n && !n->overrides.level && !n->overrides.pan && !n->overrides.tone && !n->overrides.decay &&
+               !n->overrides.drive;
+    };
+    check(inheritsSound(voice(64)) && !noteSoundOverride[3]->isChecked() && !noteSoundValue[3]->isEnabled(),
+          "new notes inherit track sound settings");
+    decay->setValue(79);
+    check(noteSoundValue[3]->value() == 79 && inheritsSound(voice(64)),
+          "changing track decay refreshes inherited note sound without creating overrides");
+    noteSoundOverride[3]->setChecked(true);
+    check(voice(64) && voice(64)->overrides.decay == .79 && noteSoundValue[3]->isEnabled(),
+          "enabling a sound override pins the current inherited value");
+    const std::array<int, 5> soundValues = {0, -40, 64, 22, 0};
+    for (size_t i = 0; i < soundValues.size(); ++i) {
+        noteSoundOverride[i]->setChecked(true);
+        noteSoundValue[i]->setValue(soundValues[i]);
+    }
+    check(voice(64) && voice(64)->overrides.level == 0 && voice(64)->overrides.pan == -.4 &&
+              voice(64)->overrides.tone == .64 && voice(64)->overrides.decay == .22 &&
+              voice(64)->overrides.drive == 0 && inheritsSound(voice(60)) && inheritsSound(voice(67)),
+          "all five sound controls affect only the selected chord tone and preserve explicit zero");
+    volume->setValue(88);
+    pan->setValue(25);
+    tone->setValue(90);
+    decay->setValue(60);
+    drive->setValue(35);
+    bool pinnedUnchanged = true;
+    for (size_t i = 0; i < soundValues.size(); ++i)
+        pinnedUnchanged &= noteSoundValue[i]->value() == soundValues[i];
+    check(pinnedUnchanged, "track sound edits leave all pinned note controls unchanged");
+    noteSoundOverride[0]->setChecked(false);
+    check(voice(64) && !voice(64)->overrides.level && noteSoundValue[0]->value() == 88 &&
+              !noteSoundValue[0]->isEnabled() && voice(64)->overrides.decay == .22,
+          "unchecking zero level restores inheritance without clearing other sound overrides");
+    noteSoundOverride[0]->setChecked(true);
+    noteSoundValue[0]->setValue(0);
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(60));
+    noteSoundOverride[1]->setChecked(true);
+    noteSoundValue[1]->setValue(-15);
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(64));
+    check(noteSoundValue[1]->value() == -40 && voice(60) && voice(60)->overrides.pan == -.15,
+          "selecting another chord tone displays and edits its own independent sound settings");
+    const auto soundEdited = projectToJson(project);
+    noteSoundReset->click();
+    check(inheritsSound(voice(64)) && voice(60) && voice(60)->overrides.pan == -.15 &&
+              inheritsSound(voice(67)) && !noteSoundReset->isEnabled() && noteSoundValue[3]->value() == 60,
+          "reset clears every selected-note sound override and displays track defaults");
+    undo(-1);
+    check(projectToJson(project) == soundEdited && noteSoundOverride[0]->isChecked() &&
+              noteSoundValue[0]->value() == 0 && noteSoundValue[3]->value() == 22,
+          "undo restores note sound overrides including explicit zero and inspector state");
+    undo(1);
+    check(inheritsSound(voice(64)), "redo reapplies note sound reset");
+    undo(-1);
     note->setValue(65);
     velocity->setValue(88);
     check(voice(65) && !voice(64) && voice(60) && voice(67),
           "pitch inspector edits only selected chord tone");
+    check(voice(65) && voice(65)->overrides.level == 0 && voice(65)->overrides.pan == -.4 &&
+              voice(65)->overrides.tone == .64 && voice(65)->overrides.decay == .22 &&
+              voice(65)->overrides.drive == 0,
+          "changing pitch preserves all selected-note sound overrides");
     check(voice(65) && std::abs(voice(65)->velocity - 88. / 127) < .0001 && voice(60) &&
               std::abs(voice(60)->velocity - 100. / 127) < .0001 && voice(67) &&
               std::abs(voice(67)->velocity - 100. / 127) < .0001,
@@ -1098,16 +1422,43 @@ int Window::smokeTest(const QString& screenshot) {
     velocity->setValue(88);
     QTest::mouseClick(editor, Qt::RightButton, Qt::NoModifier, noteAt(62));
     check(editor->phrase()->steps[0].notes.size() == 3, "erasing an empty pitch preserves its chord");
+    const auto beforeRightDelete = projectToJson(project);
+    answerDeletion(false);
+    QTest::mouseClick(editor, Qt::RightButton, Qt::NoModifier, noteAt(65));
+    check(projectToJson(project) == beforeRightDelete && voice(65) && voice(65)->overrides.decay == .22,
+          "canceling right-click deletion preserves note sound settings");
+    answerDeletion(true);
     QTest::mouseClick(editor, Qt::RightButton, Qt::NoModifier, noteAt(65));
     check(!voice(65) && voice(60) && voice(67) && editor->phrase()->steps[0].notes.size() == 2,
           "right-click erases only the targeted chord tone");
     undo(-1);
     check(voice(65) && voice(60) && voice(67) && editor->phrase()->steps[0].notes.size() == 3,
           "undo restores an erased chord tone and its siblings");
+    check(voice(65) && voice(65)->overrides.level == 0 && voice(65)->overrides.decay == .22,
+          "undo note deletion restores its sound overrides");
     auto* clearNotes = findChild<QPushButton*>("clearNotes");
     check(clearNotes != nullptr, "clear notes control exists");
-    if (clearNotes)
+    if (clearNotes) {
+        const auto beforeClear = projectToJson(project);
+        const int beforeClearHistory = historyIndex;
+        answerDeletion(false);
         clearNotes->click();
+        check(projectToJson(project) == beforeClear && historyIndex == beforeClearHistory,
+              "canceling Clear notes preserves all notes, overrides and history");
+        const int selectedBeforeClear = editor->selectedPitch;
+        answerDeletion(true);
+        QTimer::singleShot(0, this, [&] {
+            editor->selectedPitch = 60;
+            refreshSelection();
+        });
+        clearNotes->click();
+        check(projectToJson(project) == beforeClear && historyIndex == beforeClearHistory,
+              "a stale deletion confirmation cannot erase notes after selection changes");
+        editor->selectedPitch = selectedBeforeClear;
+        refreshSelection();
+        answerDeletion(true);
+        clearNotes->click();
+    }
     check(editor->phrase()->steps[0].notes.empty() && !note->isEnabled(),
           "clear notes removes every chord tone and clears inspector");
     undo(-1);
@@ -1116,6 +1467,12 @@ int Window::smokeTest(const QString& screenshot) {
     withPlaceholder.insert(withPlaceholder.begin(), Note{0, 64});
     change();
     QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(65));
+    const auto beforeSilentReplacement = projectToJson(project);
+    answerDeletion(false);
+    note->setValue(64);
+    check(projectToJson(project) == beforeSilentReplacement && note->value() == 65,
+          "canceling silent pitch replacement preserves both notes and restores pitch inspector");
+    answerDeletion(true);
     note->setValue(64);
     check(voice(64) && std::abs(voice(64)->velocity - 88. / 127) < .0001 && !voice(65) && voice(60) &&
               voice(67) && editor->phrase()->steps[0].notes.size() == 3 && editor->selectedPitch == 64,
@@ -1124,6 +1481,95 @@ int Window::smokeTest(const QString& screenshot) {
     note->setValue(60);
     check(note->value() == 64 && projectToJson(project) == beforeCollision,
           "retuning still rejects an active sibling after replacing a silent placeholder");
+    auto answerMove = [&](bool accepted, int bar, int step, bool expectCollision = false) {
+        QTimer::singleShot(0, this, [&, accepted, bar, step, expectCollision] {
+            auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            check(dialog && dialog->objectName() == "moveNoteDialog", "Move note opens its command dialog");
+            if (!dialog || dialog->objectName() != "moveNoteDialog")
+                return;
+            auto* barField = dialog->findChild<QSpinBox*>("moveNoteBar");
+            auto* stepField = dialog->findChild<QSpinBox*>("moveNoteStep");
+            auto* buttons = dialog->findChild<QDialogButtonBox*>();
+            check(barField && stepField && buttons, "move dialog contains Bar, Step and action buttons");
+            if (!barField || !stepField || !buttons) {
+                dialog->reject();
+                return;
+            }
+            check(barField->value() == editor->step / Steps + 1 &&
+                      stepField->value() == editor->step % Steps + 1,
+                  "move dialog defaults to the selected note's current location");
+            barField->setValue(bar);
+            stepField->setValue(step);
+            buttons->button(accepted ? QDialogButtonBox::Ok : QDialogButtonBox::Cancel)->click();
+            if (expectCollision) {
+                auto* error = dialog->findChild<QLabel*>("moveNoteError");
+                check(dialog->isVisible() && error && !error->text().isEmpty(),
+                      "move dialog reports a pitch collision and stays open");
+                dialog->reject();
+            }
+        });
+    };
+    const auto beforeMove = projectToJson(project);
+    int beforeMoveHistory = historyIndex;
+    check(!editor->moveSelectedNote(-1) && !editor->moveSelectedNote(Steps) &&
+              projectToJson(project) == beforeMove && historyIndex == beforeMoveHistory,
+          "out-of-phrase moves leave the entire project and history unchanged");
+    answerMove(false, 1, 16);
+    moveNoteButton->click();
+    check(projectToJson(project) == beforeMove && historyIndex == beforeMoveHistory,
+          "canceling Move note preserves all notes and history");
+    answerMove(true, 1, 1);
+    moveNoteAction->trigger();
+    check(projectToJson(project) == beforeMove && historyIndex == beforeMoveHistory,
+          "moving to the current step is a no-op without a history entry");
+    const int beforeMoveDialogs = deletionDialogs;
+    answerMove(true, 1, 16);
+    moveNoteButton->click();
+    const auto* movedNote = editor->selectedNote();
+    check(editor->step == 15 && movedNote && movedNote->note == 64 &&
+              std::abs(movedNote->velocity - 88. / 127) < .0001 && movedNote->overrides.level == 0 &&
+              movedNote->overrides.pan == -.4 && movedNote->overrides.tone == .64 &&
+              movedNote->overrides.decay == .22 && movedNote->overrides.drive == 0 && !voice(64) &&
+              voice(60) && voice(60)->overrides.pan == -.15 && voice(67) &&
+              deletionDialogs == beforeMoveDialogs,
+          "Move note preserves every setting and sibling while moving to the final step without deletion");
+    const auto afterMove = projectToJson(project);
+    undo(-1);
+    check(projectToJson(project) == beforeMove, "undo restores the complete note at its original step");
+    undo(1);
+    check(projectToJson(project) == afterMove, "redo restores the complete moved note");
+    undo(-1);
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(64));
+    editor->phrase()->steps[15].notes = {{0, 64}};
+    change();
+    const auto beforeMoveCollision = projectToJson(project);
+    beforeMoveHistory = historyIndex;
+    answerMove(true, 1, 16, true);
+    moveNoteAction->trigger();
+    check(projectToJson(project) == beforeMoveCollision && historyIndex == beforeMoveHistory,
+          "a move onto a silent same-pitch note preserves both notes and settings");
+    undo(-1);
+    resizePhrase(2);
+    editor->phrase()->steps[20].notes = {*voice(64)};
+    change();
+    const auto beforeShrink = projectToJson(project);
+    const int beforeShrinkHistory = historyIndex;
+    answerDeletion(false);
+    phraseLength->setValue(1);
+    check(projectToJson(project) == beforeShrink && historyIndex == beforeShrinkHistory &&
+              phraseLength->value() == 2 && timeline->selection()->lengthBars == 2,
+          "canceling phrase shrink restores length controls and leaves clips, notes and history unchanged");
+    answerDeletion(true);
+    phraseLength->setValue(1);
+    check(editor->phrase()->bars == 1 && editor->phrase()->steps.size() == Steps &&
+              timeline->selection()->lengthBars == 1 && voice(64) && voice(64)->overrides.decay == .22,
+          "confirmed phrase shrink removes only the truncated notes");
+    undo(-1);
+    check(projectToJson(project) == beforeShrink, "undo phrase shrink restores truncated notes and settings");
+    undo(-1);
+    undo(-1);
+    check(projectToJson(project) == beforeMove,
+          "temporary move and shrink exercises restore the original phrase");
     auto noteStroke = [&](int from, int to, int past) {
         QTest::mousePress(editor, Qt::LeftButton, Qt::NoModifier, noteAt(72, from));
         QTest::mouseMove(editor, noteAt(72, to), 20);
@@ -1134,14 +1580,55 @@ int Window::smokeTest(const QString& screenshot) {
     noteStroke(1, 2, 2);
     check(editor->phrase()->steps[1].notes.size() == 1 && editor->phrase()->steps[2].notes.size() == 1,
           "drawing a stroke and revisiting its start keeps both notes");
+    const auto beforeEraseStroke = projectToJson(project);
+    const int beforeEraseStrokeHistory = historyIndex;
+    int beforeStrokeDialogs = deletionDialogs;
+    answerDeletion(false);
+    noteStroke(1, 2, 3);
+    check(projectToJson(project) == beforeEraseStroke && historyIndex == beforeEraseStrokeHistory &&
+              deletionDialogs == beforeStrokeDialogs + 1,
+          "canceling an erase stroke keeps all notes and shows only one warning");
+    beforeStrokeDialogs = deletionDialogs;
+    answerDeletion(true);
     noteStroke(1, 2, 3);
     check(editor->phrase()->steps[1].notes.empty() && editor->phrase()->steps[2].notes.empty() &&
               editor->phrase()->steps[3].notes.empty() && voice(60) && voice(64) && voice(67),
           "a stroke starting on a note only erases, including when revisiting erased cells");
+    check(deletionDialogs == beforeStrokeDialogs + 1, "confirming an erase stroke uses one warning");
     undo(-1);
     check(editor->phrase()->steps[1].notes.size() == 1 && editor->phrase()->steps[2].notes.size() == 1,
           "one undo restores the entire erase stroke");
     undo(1);
+    {
+        const int priorTrack = timeline->track;
+        const uint64_t priorClip = timeline->selectedClip;
+        auto& sampleTrack = project.tracks[5];
+        sampleTrack.patterns.resize(1);
+        sampleTrack.patterns[0].steps[0].notes = {{.7, 48}, {0, 60}};
+        sampleTrack.patterns[0].steps[0].notes[0].overrides.decay = .45;
+        timeline->track = 5;
+        timeline->selectedClip = 0;
+        refreshSelection();
+        change();
+        const auto beforeSample = projectToJson(project);
+        const int beforeSampleHistory = historyIndex;
+        answerDeletion(false);
+        check(!applySample("/unused-test-sample.wav") && projectToJson(project) == beforeSample &&
+                  historyIndex == beforeSampleHistory,
+              "canceling sample cleanup leaves sample path, notes, settings and history unchanged");
+        answerDeletion(true);
+        check(applySample("/unused-test-sample.wav") &&
+                  project.tracks[5].patterns[0].steps[0].notes.size() == 1 &&
+                  project.tracks[5].patterns[0].steps[0].notes[0].note == 60 &&
+                  project.tracks[5].patterns[0].steps[0].notes[0].overrides.decay == .45,
+              "confirmed sample cleanup removes only silent placeholders and preserves surviving settings");
+        undo(-1);
+        check(projectToJson(project) == beforeSample, "undo sample cleanup restores removed silent notes");
+        undo(-1);
+        timeline->track = priorTrack;
+        timeline->selectedClip = priorClip;
+        refreshSelection();
+    }
     auto drag = [&](QPoint from, QPoint to, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
         QTest::mousePress(timeline, Qt::LeftButton, modifiers, from);
         QTest::mouseMove(timeline, to, 20);
@@ -1212,17 +1699,40 @@ int Window::smokeTest(const QString& screenshot) {
         Track sampleTrack;
         sampleTrack.patterns.resize(1);
         sampleTrack.patterns[0].steps[0].notes = {{.8, 60}, {.6, 64}, {.7, 67}};
+        sampleTrack.patterns[0].steps[0].notes[1].overrides.decay = .42;
         sampleTrack.patterns[0].steps[1].notes = {{.5, 72}};
         check(prepareSamplePitches(sampleTrack) && sampleTrack.patterns[0].steps[0].notes.size() == 3 &&
                   sampleTrack.patterns[0].steps[0].notes[1].note == 64 &&
+                  sampleTrack.patterns[0].steps[0].notes[1].overrides.decay == .42 &&
                   sampleTrack.patterns[0].steps[0].notes[2].note == 67 &&
                   sampleTrack.patterns[0].steps[1].notes[0].note == 72,
               "sample import preserves chord intervals and all other pitches");
         sampleTrack.patterns[0].steps[0].notes = {{.8, 36}, {0, 40}};
+        sampleTrack.patterns[0].steps[0].notes[0].overrides.level = 0;
+        sampleTrack.patterns[0].steps[0].notes[0].overrides.pan = -.3;
         check(!prepareSamplePitches(sampleTrack) && sampleTrack.patterns[0].steps[0].notes.size() == 1 &&
                   sampleTrack.patterns[0].steps[0].notes[0].note == 60 &&
+                  sampleTrack.patterns[0].steps[0].notes[0].overrides.level == 0 &&
+                  sampleTrack.patterns[0].steps[0].notes[0].overrides.pan == -.3 &&
                   sampleTrack.patterns[0].steps[1].notes[0].note == 60,
               "monophonic sample import retains original pitch behavior without duplicates");
+        sampleTrack.patterns[0].steps[0].notes = {{0, 40}, {0, 36}};
+        sampleTrack.patterns[0].steps[0].notes[1].overrides.level = 0;
+        check(!prepareSamplePitches(sampleTrack) && sampleTrack.patterns[0].steps[0].notes.size() == 1 &&
+                  sampleTrack.patterns[0].steps[0].notes[0].note == 60 &&
+                  sampleTrack.patterns[0].steps[0].notes[0].velocity == 0 &&
+                  sampleTrack.patterns[0].steps[0].notes[0].overrides.level == 0,
+              "sample import keeps and retunes a silent note with an explicit zero override");
+        sampleTrack.patterns[0].steps[0].notes = {{.8, 36}, {0, 40}};
+        sampleTrack.patterns[0].steps[0].notes[1].overrides.pan = 0;
+        sampleTrack.patterns[0].steps[1].notes = {{.5, 72}};
+        check(prepareSamplePitches(sampleTrack) && sampleTrack.patterns[0].steps[0].notes.size() == 2 &&
+                  sampleTrack.patterns[0].steps[0].notes[0].note == 36 &&
+                  sampleTrack.patterns[0].steps[0].notes[1].note == 40 &&
+                  sampleTrack.patterns[0].steps[0].notes[1].velocity == 0 &&
+                  sampleTrack.patterns[0].steps[0].notes[1].overrides.pan == 0 &&
+                  sampleTrack.patterns[0].steps[1].notes[0].note == 72,
+              "sample import preserves all pitches when a silent sibling has an override");
     }
     QString error;
     QDir().mkpath("artifacts");
@@ -1233,6 +1743,15 @@ int Window::smokeTest(const QString& screenshot) {
           "timeline save roundtrip");
     check(!loaded.tracks[2].patterns.empty() && loaded.tracks[2].patterns[0].steps[0].notes.size() == 3,
           "timeline save roundtrip retains all chord tones");
+    if (!loaded.tracks[2].patterns.empty()) {
+        const auto& savedNotes = loaded.tracks[2].patterns[0].steps[0].notes;
+        auto savedNote =
+            std::find_if(savedNotes.begin(), savedNotes.end(), [](const Note& n) { return n.note == 64; });
+        check(savedNote != savedNotes.end() && savedNote->overrides.level == 0 &&
+                  savedNote->overrides.pan == -.4 && savedNote->overrides.tone == .64 &&
+                  savedNote->overrides.decay == .22 && savedNote->overrides.drive == 0,
+              "save and reload retain every per-note sound override including zero");
+    }
     check(!loop->isChecked() && !audio.looping(), "song transport loop defaults off");
     title->setFocus();
     QTest::keyClicks(title, " a b");
@@ -1300,6 +1819,8 @@ int Window::smokeTest(const QString& screenshot) {
     auto* outer = qobject_cast<QScrollArea*>(centralWidget());
     check(outer && outer->widget()->height() > outer->viewport()->height(),
           "small window scrolls without hiding controls");
+    check(nextDeletionAnswer == deletionAnswers.size(),
+          "all expected deletion confirmations were displayed and answered");
     dirty = false;
     return failures;
 }

@@ -64,10 +64,52 @@ int dspTests() {
         p = blank();
         step(p, track, 0) = {.9, notes[track]};
         const auto first = fc::renderTrack(p, track), second = fc::renderTrack(p, track);
-        check(first.size() == static_cast<size_t>(fc::renderFrames(p)) * 2, "stereo song plus tail frame count");
+        check(first.size() == static_cast<size_t>(fc::renderFrames(p)) * 2,
+              "stereo song plus tail frame count");
         check(finite(first) && energy(first) > 0.01, "every native voice produces finite, audible sound");
         check(first == second, "native rendering and percussion noise must be deterministic");
     }
+    // Compare each override with the existing track control's audible behavior,
+    // without using the resolution helper to construct the reference.
+    const std::array<std::optional<double> fc::NoteOverrides::*, 5> noteFields = {
+        &fc::NoteOverrides::level, &fc::NoteOverrides::pan, &fc::NoteOverrides::tone,
+        &fc::NoteOverrides::decay, &fc::NoteOverrides::drive};
+    const std::array<double fc::Track::*, 5> trackFields = {
+        &fc::Track::volume, &fc::Track::pan, &fc::Track::tone, &fc::Track::decay, &fc::Track::drive};
+    const std::array<double, 5> soundValues = {.21, -.74, .06, .92, .99};
+    const auto checkNoteSound = [&](int track, const QString& samplePath) {
+        auto base = blank();
+        base.duck = 0;
+        base.tracks[track].samplePath = samplePath;
+        step(base, track, 0) = {.8, samplePath.isEmpty() ? notes[track] : 60};
+        const auto inherited = fc::renderTrack(base, track);
+        for (size_t field = 0; field < noteFields.size(); ++field) {
+            auto overridden = base, reference = base;
+            step(overridden, track, 0).notes[0].overrides.*noteFields[field] = soundValues[field];
+            reference.tracks[track].*trackFields[field] = soundValues[field];
+            const auto actual = fc::renderTrack(overridden, track);
+            check(actual == fc::renderTrack(reference, track) && actual != inherited,
+                  "each note sound override matches its track control and changes the audible voice");
+        }
+        auto pinned = base;
+        for (size_t field = 0; field < noteFields.size(); ++field)
+            step(pinned, track, 0).notes[0].overrides.*noteFields[field] = soundValues[field];
+        const auto beforeTrackEdit = fc::renderTrack(pinned, track);
+        pinned.tracks[track].volume = 0;
+        pinned.tracks[track].pan = 1;
+        pinned.tracks[track].tone = 1;
+        pinned.tracks[track].decay = 0;
+        pinned.tracks[track].drive = 0;
+        check(fc::renderTrack(pinned, track) == beforeTrackEdit,
+              "fully pinned note sound is independent of later track control changes");
+        step(pinned, track, 0).notes[0].overrides.level = 0;
+        check(energy(fc::renderTrack(pinned, track)) == 0, "explicit note level zero silences its voice");
+        step(pinned, track, 0).notes[0].overrides = {};
+        check(energy(fc::renderTrack(pinned, track)) == 0,
+              "reset note sound follows the current track level");
+    };
+    for (int track = 0; track < fc::TrackCount; ++track)
+        checkNoteSound(track, {});
     p = blank();
     p.tracks[0].decay = 1;
     step(p, 0, 15) = {1, 36};
@@ -101,6 +143,27 @@ int dspTests() {
     p.songBars = 2;
     check(energy(fc::renderTrack(p, 1), 0, 4800) == energy(unducked, 0, 4800),
           "a later kick cannot duck bass at the beginning");
+
+    p = blank();
+    p.duck = 1;
+    step(p, 0, 0) = {1, 36};
+    step(p, 1, 0) = {1, 36};
+    p.tracks[0].volume = 0;
+    const auto silentKickBass = fc::renderTrack(p, 1);
+    step(p, 0, 0).notes[0].overrides.level = 1;
+    step(p, 0, 0).notes[0].overrides.decay = .9;
+    const auto noteDucked = fc::renderTrack(p, 1);
+    auto trackDucked = p;
+    step(trackDucked, 0, 0).notes[0].overrides = {};
+    trackDucked.tracks[0].volume = 1;
+    trackDucked.tracks[0].decay = .9;
+    check(noteDucked == fc::renderTrack(trackDucked, 1) &&
+              energy(noteDucked, 0, 4800) < energy(silentKickBass, 0, 4800) * .65,
+          "kick note level and decay drive bass ducking even when the track default level is zero");
+    step(p, 0, 0).notes[0].overrides.level = 0;
+    p.tracks[0].volume = 1;
+    check(fc::renderTrack(p, 1) == silentKickBass,
+          "a zero-level kick note cannot create hidden bass ducking");
 
     p = blank();
     step(p, 0, 0) = {1, 36};
@@ -142,6 +205,41 @@ int dspTests() {
     step(p, 3, 0).notes.push_back({0, 72});
     check(fc::renderTrack(p, 3) == chord, "a zero-velocity chord member contributes no sound");
 
+    const auto checkIndependentSound = [&](const QString& samplePath) {
+        auto shared = blank();
+        shared.duck = 0;
+        shared.tracks[3].samplePath = samplePath;
+        // Same-onset chord tones and a later retrigger of the same pitch must
+        // keep distinct sound settings, including when resampling is cached.
+        step(shared, 3, 0).notes = {{.7, 60}, {.5, 64}};
+        step(shared, 3, 1).notes = {{.6, 60}};
+        step(shared, 3, 0).notes[0].overrides = {.23, -1., .12, .04, .8};
+        step(shared, 3, 0).notes[1].overrides = {.48, 1., .89, .86, .04};
+        step(shared, 3, 1).notes[0].overrides = {.71, .3, .57, .35, .6};
+        const auto actual = fc::renderTrack(shared, 3);
+        std::vector<float> reference(actual.size(), 0);
+        for (int voice = 0; voice < 3; ++voice) {
+            const int position = voice == 2 ? 1 : 0, index = voice == 2 ? 0 : voice;
+            auto single = shared;
+            for (auto& slot : single.tracks[3].patterns[0].steps)
+                slot.notes.clear();
+            auto note = step(shared, 3, position).notes[index];
+            for (size_t field = 0; field < noteFields.size(); ++field)
+                single.tracks[3].*trackFields[field] = *(note.overrides.*noteFields[field]);
+            note.overrides = {};
+            step(single, 3, position).notes = {note};
+            const auto rendered = fc::renderTrack(single, 3);
+            for (size_t i = 0; i < rendered.size(); ++i)
+                reference[i] += rendered[i];
+        }
+        double difference = 0;
+        for (size_t i = 0; i < actual.size(); ++i)
+            difference = std::max(difference, std::abs(double(actual[i] - reference[i])));
+        check(finite(actual) && energy(actual) > .01 && difference < 1e-6,
+              "chord tones and later same-pitch notes mix with their independent sound settings");
+    };
+    checkIndependentSound({});
+
     p = blank();
     p.songBars = 4;
     p.tracks[0].clips = {{1, 0, 2, 1}};
@@ -150,8 +248,7 @@ int dspTests() {
     const int barFrames = fc::songFrames(p) / 4;
     check(energy(sparse, 0, static_cast<size_t>(barFrames) * 4) == 0,
           "an empty timeline introduction remains exactly silent through mastering");
-    check(energy(sparse, static_cast<size_t>(barFrames) * 4,
-                 static_cast<size_t>(barFrames) * 6) > .01,
+    check(energy(sparse, static_cast<size_t>(barFrames) * 4, static_cast<size_t>(barFrames) * 6) > .01,
           "a clip plays at its absolute timeline position");
     check(energy(sparse, static_cast<size_t>(barFrames) * 7) < 1e-12,
           "an empty timeline ending receives no hidden phrase repetition");
@@ -168,8 +265,8 @@ int dspTests() {
     check(energy(repeated, static_cast<size_t>(twoBarFrames) * 2,
                  static_cast<size_t>(twoBarFrames) * 2 + 4000) > .01,
           "drag-extended clips repeat multi-bar phrases at their source length");
-    check(energy(repeated, static_cast<size_t>(barFrames) * 2,
-                 static_cast<size_t>(barFrames) * 2 + 4000) == 0,
+    check(energy(repeated, static_cast<size_t>(barFrames) * 2, static_cast<size_t>(barFrames) * 2 + 4000) ==
+              0,
           "a two-bar phrase is not accidentally repeated every bar");
 
     p = blank();
@@ -251,6 +348,8 @@ int dspTests() {
         check(errorMax < 2e-6, "24-bit export preserves the complete song without gaps");
         sf_close(wave);
     }
+    checkNoteSound(0, wavePath);
+    checkIndependentSound(wavePath);
     p = blank();
     p.tracks[0].samplePath = wavePath;
     step(p, 0, 0) = {1, 60};
@@ -264,15 +363,14 @@ int dspTests() {
     const auto sampledChord = fc::renderTrack(p, 0);
     double sampleChordDifference = 0;
     for (size_t i = 0; i < sampledChord.size(); ++i)
-        sampleChordDifference = std::max(sampleChordDifference,
-                                        std::abs(double(sampledChord[i] - (sampled[i] + transposed[i]))));
+        sampleChordDifference =
+            std::max(sampleChordDifference, std::abs(double(sampledChord[i] - (sampled[i] + transposed[i]))));
     check(finite(sampledChord) && sampleChordDifference < 1e-6,
           "sample chords mix independently resampled pitches at one onset");
     step(p, 0, 0).notes.clear();
     step(p, 0, 15) = {1, 48};
     const auto lateSample = fc::renderTrack(p, 0);
-    check(energy(lateSample, 0, 2000) == 0,
-          "a final-step sample cannot wrap into the song introduction");
+    check(energy(lateSample, 0, 2000) == 0, "a final-step sample cannot wrap into the song introduction");
 
     const QString heldPath = temporary.filePath("held-sample.wav");
     check(fc::writeWave(heldPath, source, error, 64), "create sample held beyond the song end");
@@ -281,8 +379,8 @@ int dspTests() {
     p.tracks[0].samplePath = heldPath;
     step(p, 0, 0) = {1, 60};
     const auto held = fc::renderProject(p);
-    check(energy(held, held.size() - 2048, held.size() - 256) > 1e-5 &&
-              held[held.size() - 2] == 0 && held.back() == 0,
+    check(energy(held, held.size() - 2048, held.size() - 256) > 1e-5 && held[held.size() - 2] == 0 &&
+              held.back() == 0,
           "a held sample with no ending tail fades to exact stereo silence at the WAV boundary");
 
     const QString longPath = temporary.filePath("four-seconds.wav");

@@ -44,6 +44,8 @@ fc::Project smallProject() {
     auto& lead = project.tracks[3];
     lead.patterns = {fc::Pattern{}};
     lead.patterns[0].steps[0].notes = {{.6, 60}, {.5, 64}, {.4, 67}};
+    lead.patterns[0].steps[0].notes[0].overrides = {.2, -.8, .3, .1, 0};
+    lead.patterns[0].steps[0].notes[1].overrides = {.4, .7, .8, .6, .5};
     lead.clips = {{fc::nextClipId(project), 0, 0, 1}};
     return project;
 }
@@ -76,7 +78,7 @@ int supervisorTests() {
     pool.render(project);
     if (!require(until([&] { return delivered == 1; }), "persistent IPC produces mix"))
         return 1;
-    if (!require(received == reference, "IPC preserves chord notes and velocities and matches direct DSP"))
+    if (!require(received == reference, "IPC preserves chord velocities and sound overrides and matches direct DSP"))
         return 1;
     // Crash an idle persistent subprocess, then require a replacement and another complete render.
     const auto killed = pool.workerPids().first();
