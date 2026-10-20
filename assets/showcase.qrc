@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/showcase">
+        <file alias="Neon-Signal-2011.ferro">../examples/Neon-Signal-2011.ferro</file>
+    </qresource>
+</RCC>

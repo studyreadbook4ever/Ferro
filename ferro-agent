@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ferro_agent_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -x "$ferro_agent_dir/ferro" ]]; then
+  exec "$ferro_agent_dir/ferro" agent "$@"
+fi
+if [[ -x "$ferro_agent_dir/build/ferro" ]]; then
+  exec "$ferro_agent_dir/build/ferro" agent "$@"
+fi
+printf '%s\n' '{"ok":false,"error":{"code":"NOT_BUILT","message":"Build Ferro first: cmake -S . -B build && cmake --build build -j 4"}}'
+exit 1

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <stdexcept>
 
 namespace fc {
 namespace {
@@ -241,6 +242,13 @@ Project demoProject() {
     for (int s = 0; s < Steps; s += 2)
         hats.patterns[0].steps[s] = {s % 4 ? .48 : .3, 72};
     hats.clips.push_back({id++, 0, 0, 14});
+    return p;
+}
+Project showcaseProject() {
+    Project p;
+    QString error;
+    if (!loadProject(":/showcase/Neon-Signal-2011.ferro", p, error))
+        throw std::runtime_error(("Cannot load bundled Neon Signal showcase: " + error).toStdString());
     return p;
 }
 QJsonObject projectToJson(const Project& p) {

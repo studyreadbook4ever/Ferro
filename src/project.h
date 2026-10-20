@@ -59,6 +59,7 @@ struct Project {
     std::array<Track, TrackCount> tracks;
 };
 Project demoProject();
+Project showcaseProject();
 Project emptyProject();
 QJsonObject projectToJson(const Project& project);
 bool projectFromJson(const QJsonObject& json, Project& out, QString& error);

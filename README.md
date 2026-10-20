@@ -1,5 +1,9 @@
 # FERRO
 
+**6트랙 음악 작업 화면과 에이전트용 작곡 CLI를 함께 제공하는 Linux DAW입니다.** 처음 열면 2010년대 초반 댄스 팝 느낌의 오리지널 곡 **〈Neon Signal - 2011〉**을 바로 듣고 편집할 수 있습니다.
+
+에이전트는 `ferro-agent`로 음표·화음·프레이즈·클립을 JSON 계획에 적어 한 번에 적용합니다. 실행 중인 창을 직접 편집하거나 화면 없이 프로젝트와 WAV를 만들 수 있습니다. **[에이전트 사용법](docs/AGENT_CLI.md)** · **[에이전트 지침](AGENTS.md)** · **[실행 가능한 4마디 계획](examples/agent-four-bars.json)**
+
 ## 먼저 알아둘 하단 조절값
 
 화면 하단의 값을 바꾸면 무엇이 달라지는지부터 확인하세요. **TRACK은 선택한 트랙의 악기와 소리 기본값**, **NOTE와 NOTE SOUND는 선택한 음 하나**, **MASTER는 곡 전체**에 관한 설정입니다. NOTE SOUND에서 따로 지정하지 않은 소리 항목은 TRACK 값을 따릅니다.
@@ -85,17 +89,18 @@ FERRO는 C++17과 Qt 6으로 만든 6트랙 작곡·편곡 도구입니다. 내�
 - 마우스로 클립 이동·반복·복사, 원본을 공유하는 클립과 독립적인 변주.
 - 트랙별 소리 기본값과 음별 LEVEL·PAN·TONE·DECAY·DRIVE, 마스터 딜레이와 베이스 덕킹.
 - 프로젝트 저장·자동 저장·실행 취소, 전체 곡의 24비트 WAV 출력.
+- JSON 계획의 원자적 적용, 검증·revision 확인, 실행 중인 창과 연결하는 에이전트 CLI.
 - 렌더링용 Supervisor·Worker Pool, 워커 재활용과 graceful reload.
 
 [하단 조절값](#먼저-알아둘-하단-조절값) · [설치와 실행](#설치와-실행) · [처음 한 곡 만들기](#처음-한-곡-만들기) · [클립과 프레이즈](#클립과-프레이즈) · [소리 조절](#소리-조절) · [저장과 출력](#저장과-출력) · [문제 해결](#문제-해결)
 
 ## 설치와 실행
 
-Linux 데스크톱의 터미널에서 소스를 내려받아 빌드합니다. GUI에는 X11 또는 Wayland 데스크톱 세션이 필요합니다. CLI 렌더링과 엔진 테스트는 화면이나 오디오 출력 장치 없이 실행할 수 있습니다.
+Linux 데스크톱의 터미널에서 소스를 내려받아 빌드합니다. GUI에는 X11 또는 Wayland 데스크톱 세션이 필요합니다. 에이전트 CLI의 파일 편집·검증·렌더링과 엔진 테스트는 화면이나 오디오 출력 장치 없이 실행할 수 있습니다. `--live` 명령은 실행 중인 GUI에 연결합니다.
 
 ### 1. 빌드 의존성 설치
 
-필요한 구성 요소는 **CMake 3.20 이상, C++17 컴파일러, Qt 6 Core·Widgets·Concurrent·Test, PortAudio, libsndfile, pkg-config**입니다. Git은 소스를 내려받을 때, Python 3는 선택 사항인 앱 메뉴 등록에 사용합니다.
+필요한 구성 요소는 **CMake 3.20 이상, C++17 컴파일러, Qt 6 Core·Widgets·Concurrent·Test·Network, PortAudio, libsndfile, pkg-config**입니다. Git은 소스를 내려받을 때, Python 3는 선택 사항인 앱 메뉴 등록에 사용합니다.
 
 Ubuntu / Debian:
 
@@ -136,11 +141,26 @@ cmake --build build -j 4
 ./install-local.sh
 ```
 
-이 스크립트는 빌드 후 현재 사용자의 앱 메뉴에 **FERRO** 실행 항목을 등록합니다. Python 3가 필요하며 관리자 권한으로 실행할 필요는 없습니다. 실행 항목은 이 저장소의 `run.sh`와 아이콘을 가리키므로 저장소 폴더를 옮겼다면 새 위치에서 다시 실행해 주세요.
+이 스크립트는 빌드 후 현재 사용자의 앱 메뉴에 **FERRO** 실행 항목을 등록하고, **`~/.local/bin/ferro-agent`** 명령도 설치합니다. Python 3가 필요하며 관리자 권한으로 실행할 필요는 없습니다. 이 경로가 `PATH`에 없다면 `~/.local/bin/ferro-agent`로 직접 실행하거나 쉘의 `PATH`에 추가하세요. 실행 항목과 CLI는 이 저장소를 가리키므로 저장소 폴더를 옮겼다면 새 위치에서 다시 실행해 주세요.
+
+### 에이전트 CLI 시작하기
+
+저장소에서는 `./ferro-agent`를 사용합니다. 에이전트 명령은 JSON으로 결과를 출력하고 실패하면 0이 아닌 종료 코드를 반환합니다. 아래 명령으로 지원하는 작업과 입력 형식을 먼저 확인하세요.
+
+```bash
+./ferro-agent help
+./ferro-agent schema
+```
+
+`./build/ferro agent ...`도 같은 기능입니다. 설치된 `ferro-agent`는 저장소 밖에서도 사용할 수 있습니다. [4마디 곡 만들기와 실행 중인 창 편집하기](docs/AGENT_CLI.md)에 복사해서 실행할 수 있는 예제가 있습니다. `new`의 기본값은 빈 곡이고, `new --demo`는 기본 쇼케이스 곡을 사용합니다.
+
+저장소 위치에 의존하지 않는 사용자 설치가 필요하면 빌드 후 `cmake --install build --prefix "$HOME/.local"`을 실행합니다. 실행 파일과 CLI는 `~/.local/bin`, 가이드와 예제는 `~/.local/share/ferro`에 설치됩니다. [설치 방법 비교](docs/AGENT_CLI.md#설치하기)도 참고하세요.
 
 ## 처음 한 곡 만들기
 
-처음 실행하면 데모가 열립니다. `Space`로 먼저 들어보세요. 데모는 120 BPM, 16마디이며 2초의 여운을 포함해 총 34초입니다. [예제 프로젝트](examples/First-song.ferro)와 [예제 WAV](examples/First-song.wav)도 제공합니다. 데모를 다시 열려면 `Song → Open demo`를 선택합니다.
+처음 실행하면 **〈Neon Signal - 2011〉**이 열립니다. `Space`로 먼저 들어보세요. **126 BPM, 48마디, 여운 3초를 포함해 약 1분 34초**인 오리지널 댄스 팝 곡입니다. Lead 신스가 중심 멜로디를 연주합니다. 도입부에서 악기를 더하고, 후렴에 리듬·베이스·화음·멜로디가 함께 나오도록 편곡되어 있습니다. 다시 열려면 `Song → Open demo`를 선택합니다.
+
+기존의 120 BPM·16마디 입문 예제도 [프로젝트](examples/First-song.ferro)와 [WAV](examples/First-song.wav)로 남아 있습니다. CLI용 새 4마디 예제는 [계획 파일](examples/agent-four-bars.json)과 [실행 방법](docs/AGENT_CLI.md)을 사용하세요.
 
 다음 순서로 진행하면 새 곡의 리듬·선율·반복·변주·출력까지 경험할 수 있습니다.
 
@@ -425,6 +445,8 @@ My-song/
 제목이나 숫자 입력칸을 편집할 때는 입력이 우선됩니다. Space·Home 등이 작동하지 않으면 타임라인이나 피아노 롤로 포커스를 옮기세요. 피아노 롤에서는 음을 Shift + 왼쪽 클릭하면 선택하고, 일반 왼쪽 클릭하면 삭제를 확인합니다. 오른쪽 클릭·드래그로도 확인 후 지울 수 있습니다.
 
 ## 명령줄 사용
+
+음악을 만들고 편집하는 에이전트는 **[`ferro-agent` 사용법](docs/AGENT_CLI.md)**을 먼저 읽으세요. `help`·`schema`로 형식을 확인하고 `inspect → validate → apply → inspect → render` 순서로 진행합니다. `--live`로 창에 적용한 계획은 Undo 한 번으로 되돌릴 수 있으며 자동 재생하지 않습니다.
 
 저장소 루트에서 실행합니다. 다음 예제는 결과를 `~/Music`에 저장합니다.
 
