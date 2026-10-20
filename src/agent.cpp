@@ -65,12 +65,14 @@ int trackIndex(const QJsonObject& o) {
     return integer(o, "track", 1, TrackCount) - 1;
 }
 int phraseIndex(const Track& t, const QJsonObject& o) {
+    if (o.value("phrase").isDouble())
+        return integer(o, "phrase", 1, int(t.patterns.size())) - 1;
     QString name = string(o, "phrase");
     int found = -1;
     for (size_t i = 0; i < t.patterns.size(); ++i)
         if (t.patterns[i].name == name) {
             if (found >= 0)
-                invalid("Phrase name '" + name + "' is ambiguous. Rename duplicate phrases in Ferro first.",
+                invalid("Phrase name '" + name + "' is ambiguous. Use the numeric phrase ID from inspect.",
                         "AMBIGUOUS_PHRASE");
             found = int(i);
         }
@@ -218,6 +220,7 @@ QJsonObject execute(Project& p, const QJsonObject& o) {
         pattern.name = name;
         t.patterns.push_back(std::move(pattern));
         result["phrase"] = name;
+        result["phrase_id"] = int(t.patterns.size());
     } else if (op == "phrase.resize" || op == "phrase.clear") {
         keys(o, op == "phrase.clear" ? QStringList{"op", "track", "phrase"}
                                      : QStringList{"op", "track", "phrase", "bars", "truncate"});
@@ -372,7 +375,8 @@ QJsonObject agentInspect(const Project& p) {
                         note["sound"] = sound;
                     notes.append(note);
                 }
-            phrases.append(QJsonObject{{"name", phrase.name},
+            phrases.append(QJsonObject{{"id", int(j) + 1},
+                                       {"name", phrase.name},
                                        {"bars", phrase.bars},
                                        {"notes", notes},
                                        {"used_by", usages(t, int(j))}});
@@ -380,6 +384,7 @@ QJsonObject agentInspect(const Project& p) {
         for (const auto& c : t.clips)
             clips.append(QJsonObject{{"id", double(c.id)},
                                      {"phrase", t.patterns[c.pattern].name},
+                                     {"phrase_id", c.pattern + 1},
                                      {"bar", c.startBar + 1},
                                      {"bars", c.lengthBars}});
         tracks.append(QJsonObject{{"track", i + 1},
@@ -445,6 +450,7 @@ bool agentApply(const Project& base, const QJsonObject& plan, Project& out, QJso
 }
 
 QJsonObject agentSchema() {
+    const QJsonObject phraseRef{{"oneOf", QJsonArray{stringSchema(), property("integer", 1, 128)}}};
     const auto track = property("integer", 1, 6), bar = property("integer", 1, 256),
                bars = property("integer", 1, 16);
     const auto level = property("number", 0, 150), percent = property("number", 0, 100),
@@ -496,26 +502,26 @@ QJsonObject agentSchema() {
         {"track"});
     add("phrase.create", {{"track", track}, {"name", stringSchema()}, {"bars", bars}},
         {"track", "name", "bars"});
-    add("phrase.clone", {{"track", track}, {"phrase", stringSchema()}, {"name", stringSchema()}},
+    add("phrase.clone", {{"track", track}, {"phrase", phraseRef}, {"name", stringSchema()}},
         {"track", "phrase", "name"});
     add("phrase.resize",
-        {{"track", track}, {"phrase", stringSchema()}, {"bars", bars}, {"truncate", boolSchema()}},
+        {{"track", track}, {"phrase", phraseRef}, {"bars", bars}, {"truncate", boolSchema()}},
         {"track", "phrase", "bars"});
-    add("phrase.clear", {{"track", track}, {"phrase", stringSchema()}}, {"track", "phrase"});
+    add("phrase.clear", {{"track", track}, {"phrase", phraseRef}}, {"track", "phrase"});
     auto notes = QJsonObject{{"type", "array"},
                              {"maxItems", 8192},
                              {"items", objectSchema(noteProps, {"bar", "step", "pitches"})}};
-    add("notes.set", {{"track", track}, {"phrase", stringSchema()}, {"notes", notes}},
+    add("notes.set", {{"track", track}, {"phrase", phraseRef}, {"notes", notes}},
         {"track", "phrase", "notes"});
     noteProps.remove("velocity");
     noteProps.remove("sound");
     notes["items"] = objectSchema(noteProps, {"bar", "step", "pitches"});
-    add("notes.remove", {{"track", track}, {"phrase", stringSchema()}, {"notes", notes}},
+    add("notes.remove", {{"track", track}, {"phrase", phraseRef}, {"notes", notes}},
         {"track", "phrase", "notes"});
     const auto id = property("integer", 1, 9007199254740991.0);
-    add("clip.create", {{"track", track}, {"phrase", stringSchema()}, {"bar", bar}, {"bars", bar}},
+    add("clip.create", {{"track", track}, {"phrase", phraseRef}, {"bar", bar}, {"bars", bar}},
         {"track", "phrase", "bar", "bars"});
-    add("clip.set", {{"track", track}, {"clip", id}, {"phrase", stringSchema()}, {"bar", bar}, {"bars", bar}},
+    add("clip.set", {{"track", track}, {"clip", id}, {"phrase", phraseRef}, {"bar", bar}, {"bars", bar}},
         {"track", "clip"});
     add("clip.remove", {{"track", track}, {"clip", id}}, {"track", "clip"});
     auto schema = objectSchema({{"version", QJsonObject{{"const", 1}}},
@@ -528,7 +534,8 @@ QJsonObject agentSchema() {
     schema["title"] = "Ferro agent plan v1";
     schema["description"] =
         "Atomic operations. Track/bar/step are 1-based, 4/4, 16 steps per bar. C4=60. Controls use GUI "
-        "units. No note duration: use decay. Unique phrase names per track; shared phrase edits affect all "
+        "units. No note duration: use decay. Phrase references are unique names or numeric IDs from inspect; "
+        "shared edits affect all "
         "using clips. Final state must fit 256 bars and 600 seconds including tail. notes.set upserts; "
         "omitted velocity/sound preserve existing values (new notes default velocity100). sound:null values "
         "restore inheritance. No unknown fields.";
@@ -570,7 +577,8 @@ QJsonObject help() {
              "Controls use GUI units: level0..150, pan-100..100, tone/decay/drive0..100, velocity0..127.",
              "Apply is all-or-nothing. Dry-run and validate never save. One live apply is one GUI Undo step; "
              "it does not start playback.",
-             "Phrases are addressed by unique name within their track. Editing a shared phrase edits every "
+             "Phrases use a unique name or numeric ID from inspect within their track. Shared phrase edits "
+             "affect every "
              "clip using it; clone for variation.",
              "No duration/gate fields. Notes trigger fixed instrument envelopes; control their tails using "
              "decay.",

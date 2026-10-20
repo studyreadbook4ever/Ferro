@@ -333,6 +333,24 @@ int agentTests() {
         everyFieldTracked &= fc::agentRevision(changed) != revision;
     }
     check(everyFieldTracked, "revision changes for every song, track, phrase, note sound and clip setting");
+    auto duplicated = p;
+    duplicated.tracks[2].patterns.push_back(duplicated.tracks[2].patterns.front());
+    reject(duplicated, plan({notes("Chords", {group(1, 1, {"C4"})})}), "AMBIGUOUS_PHRASE",
+           "duplicate human-created phrase names never silently select the wrong phrase");
+    auto byId = notes("Chords", {group(1, 1, {"C4"})});
+    byId["phrase"] = 2;
+    byId["notes"] =
+        QJsonArray{QJsonObject{{"bar", 1}, {"step", 1}, {"pitches", QJsonArray{60}}, {"velocity", 19}}};
+    fc::Project editedDuplicate;
+    check(fc::agentApply(duplicated, plan({byId}), editedDuplicate, response) &&
+              close(editedDuplicate.tracks[2].patterns[0].steps[0].notes[0].velocity, 73 / 127.) &&
+              close(editedDuplicate.tracks[2].patterns[1].steps[0].notes[0].velocity, 19 / 127.),
+          "numeric phrase IDs edit exactly the intended phrase even when GUI names duplicate");
+    const auto duplicatePhrases =
+        fc::agentInspect(duplicated)["tracks"].toArray()[2].toObject()["phrases"].toArray();
+    check(duplicatePhrases[0].toObject()["id"].toInt() == 1 &&
+              duplicatePhrases[1].toObject()["id"].toInt() == 2,
+          "inspect exposes unambiguous 1-based phrase IDs for imported projects");
     const auto schema = fc::agentSchema();
     check(schema["additionalProperties"] == false && schema["properties"]
                                                              .toObject()["operations"]

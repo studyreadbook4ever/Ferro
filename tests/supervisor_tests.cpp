@@ -58,6 +58,14 @@ void extendSong(fc::Project& project, int bars) {
 } // namespace
 
 int supervisorTests() {
+    // Shutdown must also work before any mix future was assigned. Completed
+    // result consumption is exercised by pool.stop() below (Qt 6.4 regression).
+    {
+        fc::Supervisor unused(nullptr, 1);
+        unused.stop();
+        if (!require(unused.workerPids().isEmpty(), "unused supervisor shuts down without a mix future"))
+            return 1;
+    }
     auto project = smallProject();
     const auto reference = fc::renderProject(project);
     int delivered = 0;

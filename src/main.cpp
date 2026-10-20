@@ -73,6 +73,7 @@ int main(int argc, char** argv) {
             return ok ? 0 : 1;
         }
         if (args.contains("--self-test")) {
+            std::cout << std::unitbuf;
             int failures = projectTests() + agentTests() + dspTests() + audioTests() + supervisorTests();
             std::cout << "FERRO tests: " << failures << " failures\n";
             return failures ? 1 : 0;
