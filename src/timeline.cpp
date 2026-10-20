@@ -496,9 +496,10 @@ NoteEditor::NoteEditor(Project& p, QWidget* parent) : QWidget(parent), project(p
     setObjectName("noteEditor");
     setFocusPolicy(Qt::StrongFocus);
     setMinimumHeight(250);
-    setToolTip(
-        "Click or drag to draw notes. Stack pitches in the same step to make chords. Click an existing "
-        "note to select it. Right-drag to erase individual notes. Mouse wheel shifts the pitch range.");
+    setToolTip("Click empty space to add a note; click an existing note to erase it. Drag from empty space "
+               "to draw, or from a note to erase. Shift-click to select without editing. Right-drag also "
+               "erases individual notes. Stack pitches in the same step to make chords. Mouse wheel "
+               "shifts the pitch range.");
     refresh();
 }
 Pattern* NoteEditor::phrase() {
@@ -611,7 +612,7 @@ void NoteEditor::paintEvent(QPaintEvent*) {
         p.drawLine(QPointF(x, 24), QPointF(x, height()));
     }
 }
-void NoteEditor::drawAt(QPoint pos) {
+void NoteEditor::drawAt(QPoint pos, bool press, bool selectOnly) {
     auto* p = phrase();
     if (!p || pos.x() < 64 || pos.y() < 24)
         return;
@@ -627,8 +628,12 @@ void NoteEditor::drawAt(QPoint pos) {
     lastNote = n;
     auto& notes = p->steps[s].notes;
     auto found = std::find_if(notes.begin(), notes.end(), [n](const Note& note) { return note.note == n; });
+    if (press && !selectOnly && found != notes.end() && found->velocity > 0)
+        deleting = true;
     bool modified = false;
-    if (deleting) {
+    if (selectOnly) {
+        // Selection leaves both audible notes and legacy silent placeholders unchanged.
+    } else if (deleting) {
         if (found != notes.end()) {
             notes.erase(found);
             modified = true;
@@ -649,11 +654,12 @@ void NoteEditor::mousePressEvent(QMouseEvent* e) {
     if (e->button() != Qt::LeftButton && e->button() != Qt::RightButton)
         return;
     setFocus(Qt::MouseFocusReason);
-    drawing = true;
+    bool selectOnly = e->button() == Qt::LeftButton && e->modifiers().testFlag(Qt::ShiftModifier);
+    drawing = !selectOnly;
     deleting = e->button() == Qt::RightButton;
     changed = false;
     lastStep = lastNote = -1;
-    drawAt(e->position().toPoint());
+    drawAt(e->position().toPoint(), true, selectOnly);
 }
 void NoteEditor::mouseMoveEvent(QMouseEvent* e) {
     if (drawing && e->buttons())

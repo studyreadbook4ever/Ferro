@@ -205,9 +205,10 @@ void Window::build() {
             "Arrange a complete song on the timeline.\n\nDouble-click empty track space: new clip\nDrag clip "
             "body: move (also between tracks)\nCtrl-drag: copy a clip\nDrag clip right edge: repeat its "
             "phrase\nRight-click clip: duplicate, make independent, delete\nClick timeline ruler: seek\nDrag "
-            "END marker or set Song bars: song length\n\nSelect a clip to edit notes below.\nClick / drag: "
-            "draw notes; right-drag: erase individual notes.\nStack pitches in a sixteenth-note step to make "
-            "chords. Click an existing note to select it. Scroll: change pitch "
+            "END marker or set Song bars: song length\n\nSelect a clip to edit notes below.\nClick empty "
+            "space: add a note. Click a note: erase it.\nDrag from empty space: draw; from a note: erase.\n"
+            "Shift-click: select without editing. Right-drag: erase individual notes.\nStack pitches in a "
+            "sixteenth-note step to make chords. Scroll: change pitch "
             "range.\nCopies on the same track share a phrase. Make independent for variations.\n\nSpace: "
             "Play / pause   Home: Stop and rewind\nCtrl+S: Save   Ctrl+E: Export entire song once\nLoop is "
             "optional and off by default.\nExport includes the ending tail and does not use transport Loop.");
@@ -1034,8 +1035,8 @@ int Window::smokeTest(const QString& screenshot) {
     check(project.tracks[2].clips.size() == 1, "double click creates timeline clip");
     check(editor->phrase() != nullptr, "new clip opens note editor");
     double rh = (editor->height() - 24.) / 24;
-    auto noteAt = [&](int pitch) {
-        return QPoint(64 + int((editor->width() - 64.) / 16 * .5),
+    auto noteAt = [&](int pitch, int position = 0) {
+        return QPoint(64 + int((editor->width() - 64.) / 16 * (position + .5)),
                       int(24 + (editor->baseNote + 23 - pitch + .5) * rh));
     };
     auto voice = [&](int pitch) -> const Note* {
@@ -1053,10 +1054,25 @@ int Window::smokeTest(const QString& screenshot) {
     QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(67));
     check(editor->phrase()->steps[0].notes.size() == 3 && voice(60) && voice(64) && voice(67),
           "stack three simultaneous pitches without replacing notes");
-    auto beforeSelection = projectToJson(project);
+    const auto fullChord = projectToJson(project);
     QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(64));
+    check(!voice(64) && voice(60) && voice(67) && editor->phrase()->steps[0].notes.size() == 2 &&
+              !note->isEnabled() && !velocity->isEnabled(),
+          "left-click erases only the targeted chord tone and clears its inspector");
+    undo(-1);
+    check(projectToJson(project) == fullChord, "undo restores a left-click deletion");
+    undo(1);
+    check(!voice(64) && voice(60) && voice(67), "redo reapplies a left-click deletion");
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(64));
+    check(voice(64) && voice(64)->velocity > 0 && editor->phrase()->steps[0].notes.size() == 3,
+          "clicking the erased cell again adds its note");
+    auto beforeSelection = projectToJson(project);
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(62));
+    check(projectToJson(project) == beforeSelection && !note->isEnabled(),
+          "shift-click on empty space does not add a note");
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(64));
     check(editor->selectedPitch == 64 && note->value() == 64 && projectToJson(project) == beforeSelection,
-          "clicking a chord tone selects exactly that note without editing");
+          "shift-click selects a chord tone without editing");
     note->setValue(65);
     velocity->setValue(88);
     check(voice(65) && !voice(64) && voice(60) && voice(67),
@@ -1072,6 +1088,13 @@ int Window::smokeTest(const QString& screenshot) {
     velocity->setValue(0);
     check(voice(65) && voice(65)->velocity == 0 && velocity->isEnabled(),
           "zero velocity retains the selected note for editing");
+    beforeSelection = projectToJson(project);
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(65));
+    check(projectToJson(project) == beforeSelection && velocity->value() == 0,
+          "shift-click selects a silent note without reactivating it");
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(65));
+    check(voice(65) && voice(65)->velocity > 0 && editor->phrase()->steps[0].notes.size() == 3,
+          "normal click reactivates an invisible silent note instead of erasing it");
     velocity->setValue(88);
     QTest::mouseClick(editor, Qt::RightButton, Qt::NoModifier, noteAt(62));
     check(editor->phrase()->steps[0].notes.size() == 3, "erasing an empty pitch preserves its chord");
@@ -1092,7 +1115,7 @@ int Window::smokeTest(const QString& screenshot) {
     auto& withPlaceholder = editor->phrase()->steps[0].notes;
     withPlaceholder.insert(withPlaceholder.begin(), Note{0, 64});
     change();
-    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(65));
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(65));
     note->setValue(64);
     check(voice(64) && std::abs(voice(64)->velocity - 88. / 127) < .0001 && !voice(65) && voice(60) &&
               voice(67) && editor->phrase()->steps[0].notes.size() == 3 && editor->selectedPitch == 64,
@@ -1101,6 +1124,24 @@ int Window::smokeTest(const QString& screenshot) {
     note->setValue(60);
     check(note->value() == 64 && projectToJson(project) == beforeCollision,
           "retuning still rejects an active sibling after replacing a silent placeholder");
+    auto noteStroke = [&](int from, int to, int past) {
+        QTest::mousePress(editor, Qt::LeftButton, Qt::NoModifier, noteAt(72, from));
+        QTest::mouseMove(editor, noteAt(72, to), 20);
+        QTest::mouseMove(editor, noteAt(72, past), 20);
+        QTest::mouseMove(editor, noteAt(72, from), 20);
+        QTest::mouseRelease(editor, Qt::LeftButton, Qt::NoModifier, noteAt(72, from));
+    };
+    noteStroke(1, 2, 2);
+    check(editor->phrase()->steps[1].notes.size() == 1 && editor->phrase()->steps[2].notes.size() == 1,
+          "drawing a stroke and revisiting its start keeps both notes");
+    noteStroke(1, 2, 3);
+    check(editor->phrase()->steps[1].notes.empty() && editor->phrase()->steps[2].notes.empty() &&
+              editor->phrase()->steps[3].notes.empty() && voice(60) && voice(64) && voice(67),
+          "a stroke starting on a note only erases, including when revisiting erased cells");
+    undo(-1);
+    check(editor->phrase()->steps[1].notes.size() == 1 && editor->phrase()->steps[2].notes.size() == 1,
+          "one undo restores the entire erase stroke");
+    undo(1);
     auto drag = [&](QPoint from, QPoint to, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
         QTest::mousePress(timeline, Qt::LeftButton, modifiers, from);
         QTest::mouseMove(timeline, to, 20);

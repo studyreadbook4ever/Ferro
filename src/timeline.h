@@ -75,6 +75,6 @@ class NoteEditor : public QWidget {
     Project& project;
     bool drawing = false, deleting = false, changed = false;
     int lastStep = -1, lastNote = -1;
-    void drawAt(QPoint);
+    void drawAt(QPoint, bool press = false, bool selectOnly = false);
 };
 } // namespace fc
