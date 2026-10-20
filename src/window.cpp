@@ -2,13 +2,15 @@
 #include "agent.h"
 #include "agent_ipc.h"
 #include "dsp.h"
-#include <QAction>
 #include <QAbstractSpinBox>
+#include <QAction>
 #include <QApplication>
 #include <QBoxLayout>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QDateTime>
+#include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -18,8 +20,9 @@
 #include <QFileInfo>
 #include <QFutureWatcher>
 #include <QGroupBox>
-#include <QJsonDocument>
+#include <QHeaderView>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenuBar>
@@ -35,9 +38,11 @@
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QStatusBar>
-#include <QTest>
 #include <QTemporaryDir>
+#include <QTest>
 #include <QTimer>
+#include <QTreeWidget>
+#include <QUrl>
 #include <QUuid>
 #include <QWheelEvent>
 #include <QtConcurrent>
@@ -282,8 +287,13 @@ void Window::build() {
     title->setMinimumWidth(280);
     top->addWidget(title);
     auto* saveButton = button("Save", "Ctrl+S");
+    saveButton->setObjectName("saveSong");
+    auto* manageButton = button("Manage", "Manage .ferro files, save as another name, or open a saved song");
+    manageButton->setObjectName("manageSongs");
     auto* exportButton = button("Export song", "One complete timeline + ending tail · Ctrl+E");
+    exportButton->setObjectName("exportSong");
     top->addWidget(saveButton);
+    top->addWidget(manageButton);
     top->addWidget(exportButton);
     root->addLayout(top);
     connect(title, &QLineEdit::textEdited, this, [this](const QString& text) {
@@ -291,6 +301,7 @@ void Window::build() {
         change();
     });
     connect(saveButton, &QPushButton::clicked, this, [this] { save(); });
+    connect(manageButton, &QPushButton::clicked, this, &Window::manageSongs);
     connect(exportButton, &QPushButton::clicked, this, [this] { exportWave(); });
     connect(clearAll, &QPushButton::clicked, this, &Window::clearAllNotes);
     auto* transport = new QHBoxLayout;
@@ -1380,32 +1391,23 @@ void Window::newSession(bool demo) {
     adoptProject(demo ? showcaseProject() : emptyProject(), {}, demo);
 }
 void Window::open() {
-    if (!confirmDiscard())
-        return;
-    QString path = QFileDialog::getOpenFileName(this, "Open song", QDir::homePath(),
+    QString path = QFileDialog::getOpenFileName(this, "Open song", songDirectory(),
                                                 "FERRO song (*.ferro);;JSON (*.json)");
-    if (path.isEmpty())
-        return;
+    if (!path.isEmpty())
+        openSong(path);
+}
+bool Window::openSong(const QString& path) {
+    if (!confirmDiscard())
+        return false;
     Project p;
     QString e;
     if (!loadProject(path, p, e)) {
         QMessageBox::warning(this, "Open failed", e);
-        return;
+        return false;
     }
-    audio.clear();
-    previewSeek = 0;
-    queuedSeekBar = -1;
-    resumeAfterSeek = false;
-    audioRevision = 0;
-    preparedState = {};
-    project = std::move(p);
-    projectPath = path;
-    dirty = false;
-    timeline->selectedClip = 0;
-    resetHistory();
-    refreshProject();
-    renderTimer->start();
-    report("Opened " + path);
+    adoptProject(std::move(p), QFileInfo(path).absoluteFilePath());
+    report("Opened " + projectPath);
+    return true;
 }
 bool Window::confirmDiscard() {
     if (!dirty)
@@ -1420,21 +1422,59 @@ bool Window::confirmDiscard() {
     }
     return true;
 }
-void Window::save(bool as) {
+QString Window::songDirectory() const {
+    if (!projectPath.isEmpty())
+        return QFileInfo(projectPath).absolutePath();
+    QString music = QStandardPaths::writableLocation(QStandardPaths::MusicLocation);
+    if (music.isEmpty())
+        music = QDir::homePath() + "/Music";
+    return QDir(music).filePath("Ferro");
+}
+bool Window::save(bool as, const QString& directory) {
     QString path = projectPath;
-    if (as || path.isEmpty())
-        path = QFileDialog::getSaveFileName(
-            this, "Save song",
-            projectPath.isEmpty() ? QDir::homePath() + "/Music/" + project.title + ".ferro" : projectPath,
-            "FERRO song (*.ferro)");
+    if (as || path.isEmpty()) {
+        const QString folder = directory.isEmpty() ? songDirectory() : directory;
+        if (!QDir().mkpath(folder)) {
+            QMessageBox::warning(this, "Save failed", "Cannot create song folder: " + folder);
+            return false;
+        }
+        QString name = projectPath.isEmpty() ? project.title : QFileInfo(projectPath).fileName();
+        name.replace('/', '_').replace('\\', '_');
+        if (name.trimmed().isEmpty())
+            name = "Untitled song";
+        if (!name.endsWith(".ferro", Qt::CaseInsensitive))
+            name += ".ferro";
+        QFileDialog dialog(this, as ? "Save song as" : "Save song", folder, "FERRO song (*.ferro)");
+        dialog.setObjectName("saveSongDialog");
+        dialog.setAcceptMode(QFileDialog::AcceptSave);
+        dialog.setFileMode(QFileDialog::AnyFile);
+        dialog.setDefaultSuffix("ferro");
+        dialog.selectFile(name);
+        if (dialog.exec() != QDialog::Accepted)
+            return false;
+        path = dialog.selectedFiles().value(0);
+    }
     if (path.isEmpty())
-        return;
-    if (!path.endsWith(".ferro", Qt::CaseInsensitive))
+        return false;
+    if (!path.endsWith(".ferro", Qt::CaseInsensitive)) {
         path += ".ferro";
+        if (QFileInfo::exists(path)) {
+            QMessageBox overwrite(QMessageBox::Warning, "Replace song?",
+                                  QFileInfo(path).fileName() +
+                                      " already exists. Replace it with the current song?",
+                                  QMessageBox::Save | QMessageBox::Cancel, this);
+            overwrite.setObjectName("confirmSongOverwrite");
+            overwrite.button(QMessageBox::Save)->setText("Replace");
+            overwrite.setDefaultButton(QMessageBox::Cancel);
+            overwrite.setEscapeButton(QMessageBox::Cancel);
+            if (overwrite.exec() != QMessageBox::Save)
+                return false;
+        }
+    }
     QString e;
     if (!saveProject(path, project, e)) {
         QMessageBox::warning(this, "Save failed", e);
-        return;
+        return false;
     }
     projectPath = path;
     dirty = false;
@@ -1442,6 +1482,109 @@ void Window::save(bool as) {
     QFile::remove(autosavePath);
     setWindowTitle("FERRO · " + project.title);
     report("Saved " + path);
+    return true;
+}
+void Window::manageSongs() {
+    QDialog dialog(this);
+    dialog.setObjectName("manageSongsDialog");
+    dialog.setWindowTitle("Manage songs");
+    dialog.resize(760, 480);
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->addWidget(new QLabel("Current file"));
+    auto* current = new QLineEdit;
+    current->setObjectName("managedCurrentFile");
+    current->setReadOnly(true);
+    layout->addWidget(current);
+    auto* state = new QLabel;
+    state->setObjectName("managedSaveState");
+    layout->addWidget(state);
+    QString folder = songDirectory();
+    auto* folderRow = new QHBoxLayout;
+    folderRow->addWidget(new QLabel("Song folder"));
+    auto* location = new QLineEdit;
+    location->setObjectName("managedSongFolder");
+    location->setReadOnly(true);
+    folderRow->addWidget(location, 1);
+    auto* browse = button("Choose folder…");
+    folderRow->addWidget(browse);
+    layout->addLayout(folderRow);
+    auto* files = new QTreeWidget;
+    files->setObjectName("managedSongFiles");
+    files->setHeaderLabels({"File", "Modified"});
+    files->setRootIsDecorated(false);
+    files->setSelectionMode(QAbstractItemView::SingleSelection);
+    files->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    files->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    files->setStyleSheet("QTreeWidget{background:#161e1b;border:1px solid #445348;}"
+                         "QTreeWidget::item{padding:6px;}QTreeWidget::item:selected{background:#43564a;}"
+                         "QHeaderView::section{background:#303b37;border:0;padding:6px;}");
+    layout->addWidget(files, 1);
+    auto* empty = new QLabel("No .ferro songs here yet. Use Save as… to save the current song.");
+    layout->addWidget(empty);
+    auto* actions = new QHBoxLayout;
+    auto* saveAs = button("Save as…", "Save under another name; future Save uses the new file");
+    saveAs->setObjectName("managedSaveAs");
+    auto* openSelected = button("Open selected");
+    openSelected->setObjectName("managedOpen");
+    auto* openFolder = button("Open folder");
+    auto* close = button("Close");
+    close->setDefault(true);
+    actions->addWidget(saveAs);
+    actions->addWidget(openSelected);
+    actions->addWidget(openFolder);
+    actions->addStretch();
+    actions->addWidget(close);
+    layout->addLayout(actions);
+    auto refresh = [&] {
+        current->setText(projectPath);
+        current->setPlaceholderText("Not saved yet");
+        current->setToolTip(projectPath);
+        state->setText(dirty ? "Unsaved changes" : (projectPath.isEmpty() ? "Not saved yet" : "Saved"));
+        location->setText(folder);
+        location->setToolTip(folder);
+        files->clear();
+        for (const auto& file : QDir(folder).entryInfoList(QDir::Files, QDir::Time)) {
+            if (file.suffix().compare("ferro", Qt::CaseInsensitive) != 0)
+                continue;
+            auto* item = new QTreeWidgetItem(
+                files, {file.fileName(), file.lastModified().toString("yyyy-MM-dd HH:mm")});
+            item->setData(0, Qt::UserRole, file.absoluteFilePath());
+            item->setToolTip(0, file.absoluteFilePath());
+            if (file.absoluteFilePath() == QFileInfo(projectPath).absoluteFilePath())
+                files->setCurrentItem(item);
+        }
+        empty->setVisible(files->topLevelItemCount() == 0);
+        openSelected->setEnabled(files->currentItem());
+    };
+    connect(files, &QTreeWidget::itemSelectionChanged, &dialog,
+            [&] { openSelected->setEnabled(files->currentItem()); });
+    auto openFile = [&] {
+        auto* selected = files->currentItem();
+        if (selected && openSong(selected->data(0, Qt::UserRole).toString()))
+            dialog.accept();
+    };
+    connect(openSelected, &QPushButton::clicked, &dialog, openFile);
+    connect(files, &QTreeWidget::itemActivated, &dialog, [&](QTreeWidgetItem*, int) { openFile(); });
+    connect(saveAs, &QPushButton::clicked, &dialog, [&] {
+        if (save(true, folder))
+            folder = QFileInfo(projectPath).absolutePath();
+        refresh();
+    });
+    connect(browse, &QPushButton::clicked, &dialog, [&] {
+        const QString selected = QFileDialog::getExistingDirectory(&dialog, "Choose song folder", folder);
+        if (!selected.isEmpty()) {
+            folder = selected;
+            refresh();
+        }
+    });
+    connect(openFolder, &QPushButton::clicked, &dialog, [&] {
+        if (!QDir().mkpath(folder) || !QDesktopServices::openUrl(QUrl::fromLocalFile(folder)))
+            QMessageBox::warning(&dialog, "Open folder failed", "Cannot open song folder: " + folder);
+    });
+    connect(close, &QPushButton::clicked, &dialog, &QDialog::accept);
+    refresh();
+    files->setFocus();
+    dialog.exec();
 }
 void Window::importSample() {
     QString path = QFileDialog::getOpenFileName(this, "Load sample (up to 16 seconds)", QDir::homePath(),
@@ -1608,6 +1751,179 @@ int Window::smokeTest(const QString& screenshot) {
                       reply.value("revision").toString() == agentRevision(project) &&
                       reply.value("project").toObject() == projectToJson(project),
                   "an actual local socket returns a complete current GUI snapshot");
+        }
+    }
+    {
+        auto* manage = findChild<QPushButton*>("manageSongs");
+        auto* saveControl = findChild<QPushButton*>("saveSong");
+        auto* exportControl = findChild<QPushButton*>("exportSong");
+        check(manage && saveControl && exportControl && saveControl->x() < manage->x() &&
+                  manage->x() < exportControl->x(),
+              "Manage sits between Save and Export song in the header");
+        if (manage) {
+            QTemporaryDir songs;
+            const QString originalPath = songs.filePath("Original.ferro");
+            const QString copyPath = songs.filePath("Renamed.ferro");
+            Project original = demoProject();
+            QString error;
+            check(saveProject(originalPath, original, error), "prepare an existing managed song");
+            adoptProject(original, originalPath);
+            project.title = "Managed copy";
+            change();
+            const auto pending = projectToJson(project);
+            const int pendingHistory = historyIndex;
+            QTimer::singleShot(0, this, [&] {
+                auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                auto* current = dialog ? dialog->findChild<QLineEdit*>("managedCurrentFile") : nullptr;
+                auto* state = dialog ? dialog->findChild<QLabel*>("managedSaveState") : nullptr;
+                auto* files = dialog ? dialog->findChild<QTreeWidget*>("managedSongFiles") : nullptr;
+                auto* saveAs = dialog ? dialog->findChild<QPushButton*>("managedSaveAs") : nullptr;
+                check(dialog && dialog->objectName() == "manageSongsDialog" && current && state && files &&
+                          saveAs,
+                      "Manage opens file paths, save state, saved songs and Save as controls");
+                if (!dialog || !current || !state || !files || !saveAs) {
+                    if (dialog)
+                        dialog->reject();
+                    return;
+                }
+                check(current->text() == originalPath && state->text() == "Unsaved changes" &&
+                          files->topLevelItemCount() == 1,
+                      "Manage identifies the current file and lists existing .ferro songs");
+                QTimer::singleShot(0, this, [&] {
+                    auto* chooser = qobject_cast<QFileDialog*>(QApplication::activeModalWidget());
+                    check(chooser && chooser->objectName() == "saveSongDialog",
+                          "Save as opens a file chooser");
+                    if (chooser)
+                        chooser->reject();
+                });
+                saveAs->click();
+                check(projectPath == originalPath && dirty && projectToJson(project) == pending &&
+                          historyIndex == pendingHistory,
+                      "canceling managed Save as preserves the working file, edits and Undo history");
+                const QString collisionPath = songs.filePath("Revision.old.ferro");
+                QFile existing(collisionPath);
+                check(existing.open(QIODevice::WriteOnly) && existing.write("keep existing file") == 18,
+                      "prepare a final-extension filename collision");
+                existing.close();
+                QTimer::singleShot(0, this, [&] {
+                    auto* chooser = qobject_cast<QFileDialog*>(QApplication::activeModalWidget());
+                    if (chooser) {
+                        chooser->selectFile(songs.filePath("Revision.old"));
+                        QTimer::singleShot(0, this, [&] {
+                            auto* warning = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+                            check(warning && warning->objectName() == "confirmSongOverwrite" &&
+                                      warning->defaultButton() == warning->button(QMessageBox::Cancel),
+                                  "adding .ferro checks the actual destination before overwriting");
+                            if (warning)
+                                warning->button(QMessageBox::Cancel)->click();
+                        });
+                        QMetaObject::invokeMethod(chooser, "accept", Qt::DirectConnection);
+                    }
+                });
+                saveAs->click();
+                check(existing.open(QIODevice::ReadOnly) && existing.readAll() == "keep existing file" &&
+                          projectPath == originalPath && dirty && projectToJson(project) == pending,
+                      "canceling the final-path overwrite preserves both the existing file and unsaved song");
+                existing.close();
+                existing.remove();
+                QTimer::singleShot(0, this, [&] {
+                    auto* chooser = qobject_cast<QFileDialog*>(QApplication::activeModalWidget());
+                    check(chooser && chooser->defaultSuffix() == "ferro",
+                          "Save as uses the .ferro extension");
+                    if (chooser) {
+                        chooser->selectFile(songs.filePath("Renamed"));
+                        QMetaObject::invokeMethod(chooser, "accept", Qt::DirectConnection);
+                    }
+                });
+                saveAs->click();
+                Project loaded, untouched;
+                check(projectPath == copyPath && !dirty && savedState == pending &&
+                          historyIndex == pendingHistory && loadProject(copyPath, loaded, error) &&
+                          projectToJson(loaded) == pending && loadProject(originalPath, untouched, error) &&
+                          projectToJson(untouched) == projectToJson(original),
+                      "Save as writes the edited song, switches future Save target, and preserves the "
+                      "original");
+                check(current->text() == copyPath && state->text() == "Saved" &&
+                          files->topLevelItemCount() == 2 && files->currentItem() &&
+                          files->currentItem()->data(0, Qt::UserRole).toString() == copyPath,
+                      "Manage refreshes its saved state and selects the newly saved file");
+                dialog->accept();
+            });
+            manage->click();
+            project.title = "Continue editing the renamed file";
+            change();
+            check(save(), "ordinary Save updates the newly managed file without another chooser");
+            Project loaded, untouched;
+            check(loadProject(copyPath, loaded, error) && projectToJson(loaded) == projectToJson(project) &&
+                      loadProject(originalPath, untouched, error) &&
+                      projectToJson(untouched) == projectToJson(original),
+                  "continued edits save to the renamed file and leave the original song intact");
+            QTimer::singleShot(0, this, [&] {
+                auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                auto* files = dialog ? dialog->findChild<QTreeWidget*>("managedSongFiles") : nullptr;
+                auto* openSelected = dialog ? dialog->findChild<QPushButton*>("managedOpen") : nullptr;
+                if (!dialog || !files || !openSelected) {
+                    check(false, "Manage contains the saved song opener");
+                    if (dialog)
+                        dialog->reject();
+                    return;
+                }
+                for (int i = 0; i < files->topLevelItemCount(); ++i)
+                    if (files->topLevelItem(i)->data(0, Qt::UserRole).toString() == originalPath)
+                        files->setCurrentItem(files->topLevelItem(i));
+                openSelected->click();
+            });
+            manage->click();
+            check(projectPath == originalPath && projectToJson(project) == projectToJson(original) &&
+                      !dirty && historyIndex == 0 && !editor->phrase(),
+                  "opening a managed song loads it and resets selection and history safely");
+            project.title = "Keep these unsaved edits";
+            change();
+            const auto beforeCanceledOpen = projectToJson(project);
+            QTimer::singleShot(0, this, [&] {
+                auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                auto* openSelected = dialog ? dialog->findChild<QPushButton*>("managedOpen") : nullptr;
+                if (!dialog || !openSelected) {
+                    check(false, "Manage remains available with unsaved edits");
+                    if (dialog)
+                        dialog->reject();
+                    return;
+                }
+                QTimer::singleShot(0, this, [&] {
+                    auto* warning = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+                    check(warning && warning->windowTitle() == "Unsaved song",
+                          "opening a managed song asks about unsaved edits");
+                    if (warning)
+                        warning->button(QMessageBox::Cancel)->click();
+                });
+                openSelected->click();
+                check(projectToJson(project) == beforeCanceledOpen && projectPath == originalPath && dirty &&
+                          historyIndex == 1,
+                      "canceling managed Open preserves unsaved music and history");
+                dialog->reject();
+            });
+            manage->click();
+            QTimer::singleShot(0, this, [&] {
+                auto* dialog = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                auto* openSelected = dialog ? dialog->findChild<QPushButton*>("managedOpen") : nullptr;
+                if (!dialog || !openSelected) {
+                    check(false, "Manage can reopen the current working file");
+                    if (dialog)
+                        dialog->reject();
+                    return;
+                }
+                QTimer::singleShot(0, this, [&] {
+                    auto* warning = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
+                    if (warning)
+                        warning->button(QMessageBox::Save)->click();
+                });
+                openSelected->click();
+            });
+            manage->click();
+            check(projectPath == originalPath && projectToJson(project) == beforeCanceledOpen && !dirty &&
+                      loadProject(originalPath, loaded, error) && projectToJson(loaded) == beforeCanceledOpen,
+                  "saving before reopening the same file loads the newly saved edits, not an old snapshot");
+            projectPath.clear();
         }
     }
     {

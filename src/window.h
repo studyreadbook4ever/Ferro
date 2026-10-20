@@ -77,7 +77,10 @@ class Window : public QMainWindow {
     void tick();
     void togglePlay();
     void stopPlayback();
-    void save(bool as = false);
+    bool save(bool as = false, const QString& directory = {});
+    QString songDirectory() const;
+    void manageSongs();
+    bool openSong(const QString& path);
     void open();
     void newSession(bool demo);
     void exportWave();
