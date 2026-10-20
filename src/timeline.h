@@ -54,13 +54,15 @@ class Timeline : public QWidget {
 class NoteEditor : public QWidget {
   public:
     explicit NoteEditor(Project& project, QWidget* parent = nullptr);
-    int track = -1, pattern = -1, step = 0, baseNote = 48;
+    int track = -1, pattern = -1, step = 0, selectedPitch = -1, baseNote = 48;
     double playStep = -1;
     std::function<void(bool)> edited;
     void select(int track, int pattern);
     void refresh();
     void fitNotes();
     Pattern* phrase();
+    Note* selectedNote();
+    int defaultNote() const;
 
   protected:
     void paintEvent(QPaintEvent*) override;
@@ -73,6 +75,6 @@ class NoteEditor : public QWidget {
     Project& project;
     bool drawing = false, deleting = false, changed = false;
     int lastStep = -1, lastNote = -1;
-    void drawAt(QPoint, bool press);
+    void drawAt(QPoint);
 };
 } // namespace fc

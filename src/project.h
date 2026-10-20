@@ -9,11 +9,17 @@ namespace fc {
 constexpr int SampleRate = 48000;
 constexpr int TrackCount = 6;
 constexpr int Steps = 16;
+constexpr int MaxNotesPerStep = 128;
 constexpr int MaxSongBars = 256;
 constexpr double MaxSongSeconds = 600.0;
-struct Step {
+struct Note {
     double velocity = 0.0;
     int note = 60;
+};
+struct Step {
+    std::vector<Note> notes;
+    Step() = default;
+    Step(double velocity, int note) : notes{{velocity, note}} {}
 };
 struct Pattern {
     QString name = "Phrase";
@@ -56,6 +62,6 @@ int contentEndBar(const Project& project);
 uint64_t nextClipId(const Project& project);
 QString noteName(int midi);
 QString instrumentName(int instrument);
-struct ScheduledStep { int frame; Step step; uint64_t eventId; };
+struct ScheduledStep { int frame; Note step; uint64_t eventId; };
 std::vector<ScheduledStep> scheduledSteps(const Project& project, int track);
 } // namespace fc

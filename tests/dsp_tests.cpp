@@ -105,7 +105,7 @@ int dspTests() {
     p = blank();
     step(p, 0, 0) = {1, 36};
     const auto kick = fc::renderTrack(p, 0);
-    step(p, 0, 0).note = 43;
+    step(p, 0, 0).notes[0].note = 43;
     check(fc::renderTrack(p, 0) != kick, "kick tuning must change its waveform");
     p.tracks[0].instrument = 3;
     check(fc::renderTrack(p, 0) != kick, "instrument selection is independent of track index");
@@ -118,6 +118,29 @@ int dspTests() {
     for (size_t i = 1; i < panned.size(); i += 2)
         right += std::abs(panned[i]);
     check(right == 0, "hard left pan must silence the right channel");
+
+    p = blank();
+    p.tracks[3].volume = .35;
+    step(p, 3, 0).notes = {{.7, 60}, {.5, 64}, {.4, 67}};
+    step(p, 3, 8).notes = {{.6, 57}, {.4, 60}, {.3, 64}};
+    const auto chord = fc::renderTrack(p, 3);
+    std::vector<float> separateVoices(chord.size(), 0);
+    for (int voice = 0; voice < 3; ++voice) {
+        auto single = p;
+        for (int position : {0, 8})
+            step(single, 3, position).notes = {step(p, 3, position).notes[voice]};
+        const auto rendered = fc::renderTrack(single, 3);
+        for (size_t i = 0; i < rendered.size(); ++i)
+            separateVoices[i] += rendered[i];
+    }
+    double chordDifference = 0;
+    for (size_t i = 0; i < chord.size(); ++i)
+        chordDifference = std::max(chordDifference, std::abs(double(chord[i] - separateVoices[i])));
+    check(finite(chord) && energy(chord) > .01 && chordDifference < 1e-6,
+          "a same-track chord sums all pitched voices with independent velocities");
+    check(fc::renderTrack(p, 3) == chord, "polyphonic rendering is deterministic");
+    step(p, 3, 0).notes.push_back({0, 72});
+    check(fc::renderTrack(p, 3) == chord, "a zero-velocity chord member contributes no sound");
 
     p = blank();
     p.songBars = 4;
@@ -233,11 +256,19 @@ int dspTests() {
     step(p, 0, 0) = {1, 60};
     const auto sampled = fc::renderTrack(p, 0);
     check(finite(sampled) && energy(sampled) > .01, "imported stereo WAV can be resampled and triggered");
-    step(p, 0, 0).note = 72;
+    step(p, 0, 0).notes[0].note = 72;
     const auto transposed = fc::renderTrack(p, 0);
     check(finite(transposed) && transposed != sampled && energy(transposed, 6000) == 0,
           "octave sample transposition shortens its duration");
-    step(p, 0, 0).velocity = 0;
+    step(p, 0, 0).notes = {{1, 60}, {1, 72}};
+    const auto sampledChord = fc::renderTrack(p, 0);
+    double sampleChordDifference = 0;
+    for (size_t i = 0; i < sampledChord.size(); ++i)
+        sampleChordDifference = std::max(sampleChordDifference,
+                                        std::abs(double(sampledChord[i] - (sampled[i] + transposed[i]))));
+    check(finite(sampledChord) && sampleChordDifference < 1e-6,
+          "sample chords mix independently resampled pitches at one onset");
+    step(p, 0, 0).notes.clear();
     step(p, 0, 15) = {1, 48};
     const auto lateSample = fc::renderTrack(p, 0);
     check(energy(lateSample, 0, 2000) == 0,
@@ -281,6 +312,17 @@ int dspTests() {
         resamplingBudget = QString::fromUtf8(e.what()).contains("resampling budget");
     }
     check(resamplingBudget, "many sample pitches fail preflight before excessive sinc conversion");
+    for (auto& event : p.tracks[0].patterns[0].steps)
+        event.notes.clear();
+    for (int pitch = 48; pitch < 64; ++pitch)
+        step(p, 0, 0).notes.push_back({1, pitch});
+    resamplingBudget = false;
+    try {
+        fc::renderTrack(p, 0);
+    } catch (const std::exception& e) {
+        resamplingBudget = QString::fromUtf8(e.what()).contains("resampling budget");
+    }
+    check(resamplingBudget, "simultaneous sample pitches also count toward the resampling work budget");
     check(!fc::writeWave(temporary.filePath("bad.wav"), {0, std::numeric_limits<float>::infinity()}, error),
           "reject non-finite WAV export");
     check(!fc::writeWave(temporary.filePath("odd.wav"), {.1f}, error), "reject incomplete stereo frames");

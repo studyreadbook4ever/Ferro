@@ -81,9 +81,6 @@ void Timeline::createClip(int t, int bar) {
     Pattern phrase;
     QString suffix = QString(" %1").arg(tr.patterns.size() + 1);
     phrase.name = tr.name.left(80 - suffix.size()) + suffix;
-    constexpr int roots[] = {36, 36, 60, 60, 60, 72};
-    for (auto& s : phrase.steps)
-        s.note = tr.samplePath.isEmpty() ? roots[tr.instrument] : 60;
     Clip c{nextClipId(project), int(tr.patterns.size()), bar, 1};
     tr.patterns.push_back(std::move(phrase));
     tr.clips.push_back(c);
@@ -235,13 +232,13 @@ void Timeline::paintEvent(QPaintEvent*) {
             }
             int sourceBar = b % phrase->bars;
             for (int s = 0; s < Steps; ++s) {
-                auto& note = phrase->steps[sourceBar * Steps + s];
-                if (note.velocity > 0) {
-                    double x = Header + (c.startBar + b + s / 16.) * scale;
-                    p.setPen(QColor("#263c33"));
-                    double y = box.bottom() - 4 - (note.note % 12) * .6;
-                    p.drawLine(QPointF(x + 2, y), QPointF(x + std::max(2., scale / 32), y));
-                }
+                for (const auto& note : phrase->steps[sourceBar * Steps + s].notes)
+                    if (note.velocity > 0) {
+                        double x = Header + (c.startBar + b + s / 16.) * scale;
+                        p.setPen(QColor("#263c33"));
+                        double y = box.bottom() - 4 - (note.note % 12) * .6;
+                        p.drawLine(QPointF(x + 2, y), QPointF(x + std::max(2., scale / 32), y));
+                    }
             }
         }
         p.restore();
@@ -499,8 +496,9 @@ NoteEditor::NoteEditor(Project& p, QWidget* parent) : QWidget(parent), project(p
     setObjectName("noteEditor");
     setFocusPolicy(Qt::StrongFocus);
     setMinimumHeight(250);
-    setToolTip("Click or drag to draw notes. Click an existing note to select. Right-drag to erase. One note "
-               "per step. Mouse wheel shifts the pitch range.");
+    setToolTip(
+        "Click or drag to draw notes. Stack pitches in the same step to make chords. Click an existing "
+        "note to select it. Right-drag to erase individual notes. Mouse wheel shifts the pitch range.");
     refresh();
 }
 Pattern* NoteEditor::phrase() {
@@ -509,11 +507,34 @@ Pattern* NoteEditor::phrase() {
         return nullptr;
     return &project.tracks[track].patterns[pattern];
 }
+Note* NoteEditor::selectedNote() {
+    auto* p = phrase();
+    if (!p || step < 0 || step >= int(p->steps.size()))
+        return nullptr;
+    auto& notes = p->steps[step].notes;
+    auto found =
+        std::find_if(notes.begin(), notes.end(), [this](const Note& n) { return n.note == selectedPitch; });
+    return found == notes.end() ? nullptr : &*found;
+}
+int NoteEditor::defaultNote() const {
+    constexpr int roots[] = {36, 36, 60, 60, 60, 72};
+    if (track < 0 || track >= TrackCount)
+        return 60;
+    const auto& tr = project.tracks[track];
+    return tr.samplePath.isEmpty() ? roots[tr.instrument] : 60;
+}
 void NoteEditor::select(int t, int p) {
     bool different = track != t || pattern != p;
     track = t;
     pattern = p;
     step = 0;
+    selectedPitch = -1;
+    if (auto* selected = phrase())
+        for (const auto& n : selected->steps[0].notes)
+            if (n.velocity > 0) {
+                selectedPitch = n.note;
+                break;
+            }
     if (different)
         fitNotes();
     refresh();
@@ -523,11 +544,12 @@ void NoteEditor::fitNotes() {
     if (!p)
         return;
     int lo = 128;
-    for (auto& s : p->steps)
-        if (s.velocity > 0)
-            lo = std::min(lo, s.note);
+    for (const auto& s : p->steps)
+        for (const auto& n : s.notes)
+            if (n.velocity > 0)
+                lo = std::min(lo, n.note);
     if (lo == 128)
-        lo = p->steps.empty() ? 60 : p->steps[0].note;
+        lo = defaultNote();
     baseNote = std::clamp((lo / 12) * 12, 0, 104);
     update();
 }
@@ -571,25 +593,25 @@ void NoteEditor::paintEvent(QPaintEvent*) {
                        QString("%1.%2").arg(s / 16 + 1).arg(s % 16 / 4 + 1));
         }
     }
-    for (size_t s = 0; s < phrase->steps.size(); ++s) {
-        const auto& note = phrase->steps[s];
-        if (note.velocity <= 0 || note.note < baseNote || note.note >= baseNote + 24)
-            continue;
-        double y = 24 + (baseNote + 23 - note.note) * rh;
-        QRectF box(65 + s * cw, y + 1, cw - 2, rh - 2);
-        QColor color = colors[track];
-        color.setAlpha(100 + int(note.velocity * 150));
-        p.setBrush(color);
-        p.setPen(int(s) == step ? QColor("#f1dfb9") : QColor("#8da58f"));
-        p.drawRoundedRect(box, 2, 2);
-    }
+    for (size_t s = 0; s < phrase->steps.size(); ++s)
+        for (const auto& note : phrase->steps[s].notes) {
+            if (note.velocity <= 0 || note.note < baseNote || note.note >= baseNote + 24)
+                continue;
+            double y = 24 + (baseNote + 23 - note.note) * rh;
+            QRectF box(65 + s * cw, y + 1, cw - 2, rh - 2);
+            QColor color = colors[track];
+            color.setAlpha(100 + int(note.velocity * 150));
+            p.setBrush(color);
+            p.setPen(int(s) == step && note.note == selectedPitch ? QColor("#f1dfb9") : QColor("#8da58f"));
+            p.drawRoundedRect(box, 2, 2);
+        }
     if (playStep >= 0) {
         p.setPen(QPen(QColor("#d7c49a"), 1));
         double x = 64 + playStep * cw;
         p.drawLine(QPointF(x, 24), QPointF(x, height()));
     }
 }
-void NoteEditor::drawAt(QPoint pos, bool press) {
+void NoteEditor::drawAt(QPoint pos) {
     auto* p = phrase();
     if (!p || pos.x() < 64 || pos.y() < 24)
         return;
@@ -598,19 +620,24 @@ void NoteEditor::drawAt(QPoint pos, bool press) {
     if (s < 0 || s >= int(p->steps.size()) || n < baseNote || n > baseNote + 23)
         return;
     step = s;
+    selectedPitch = n;
     if (s == lastStep && n == lastNote)
         return;
     lastStep = s;
     lastNote = n;
-    auto& dest = p->steps[s];
+    auto& notes = p->steps[s].notes;
+    auto found = std::find_if(notes.begin(), notes.end(), [n](const Note& note) { return note.note == n; });
     bool modified = false;
     if (deleting) {
-        modified = dest.velocity > 0;
-        dest.velocity = 0;
-    } else if (!press || dest.velocity == 0 || dest.note != n) {
-        dest.note = n;
-        if (dest.velocity == 0)
-            dest.velocity = 100. / 127;
+        if (found != notes.end()) {
+            notes.erase(found);
+            modified = true;
+        }
+    } else if (found == notes.end()) {
+        notes.push_back({100. / 127, n});
+        modified = true;
+    } else if (found->velocity == 0) {
+        found->velocity = 100. / 127;
         modified = true;
     }
     changed |= modified;
@@ -626,11 +653,11 @@ void NoteEditor::mousePressEvent(QMouseEvent* e) {
     deleting = e->button() == Qt::RightButton;
     changed = false;
     lastStep = lastNote = -1;
-    drawAt(e->position().toPoint(), true);
+    drawAt(e->position().toPoint());
 }
 void NoteEditor::mouseMoveEvent(QMouseEvent* e) {
     if (drawing && e->buttons())
-        drawAt(e->position().toPoint(), false);
+        drawAt(e->position().toPoint());
 }
 void NoteEditor::mouseReleaseEvent(QMouseEvent*) {
     drawing = false;

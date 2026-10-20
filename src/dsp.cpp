@@ -336,7 +336,7 @@ bool audible(const Project& p, int track) {
 
 template <class Callback> void events(const Project& p, int track, Callback callback) {
     for (const auto& scheduled : scheduledSteps(p, track)) {
-        Step event = scheduled.step;
+        Note event = scheduled.step;
         event.velocity = bounded(event.velocity, 0, 1);
         if (event.note < 0 || event.note > 127)
             throw std::runtime_error("A note is outside MIDI range 0–127.");
@@ -406,7 +406,7 @@ std::vector<float> renderTrack(const Project& project, int trackIndex) {
         constexpr uint64_t MaxResampleTaps = 100'000'000;
         uint64_t mixedFrames = 0, resampleTaps = 0;
         std::array<bool, 128> seen{};
-        events(project, trackIndex, [&](int onset, const Step& event, uint64_t) {
+        events(project, trackIndex, [&](int onset, const Note& event, uint64_t) {
             const size_t length = sampleVoiceFrames(*sample, event.note, 60);
             mixedFrames += std::min(length, static_cast<size_t>(frames - onset));
             if (!seen[event.note]) {
@@ -423,7 +423,7 @@ std::vector<float> renderTrack(const Project& project, int trackIndex) {
         });
     }
     size_t cacheBytes = 0;
-    events(project, trackIndex, [&](int onset, const Step& event, uint64_t eventId) {
+    events(project, trackIndex, [&](int onset, const Note& event, uint64_t eventId) {
         const double level = event.velocity * volume;
         if (sample) {
             auto existing = pitched.find(event.note);
@@ -475,7 +475,7 @@ std::vector<float> renderTrack(const Project& project, int trackIndex) {
             const auto& kick = project.tracks[kickTrack];
             if (kick.instrument != 0 || !audible(project, kickTrack))
                 continue;
-            events(project, kickTrack, [&](int onset, const Step& event, uint64_t) {
+            events(project, kickTrack, [&](int onset, const Note& event, uint64_t) {
                 const double release = .035 + bounded(kick.decay, 0, 1) * .10;
                 const int duration = static_cast<int>(release * 7 * SampleRate);
                 const double strength = amount * .96 * event.velocity * bounded(kick.volume, 0, 1);

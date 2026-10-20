@@ -31,23 +31,35 @@ bool integer(const QJsonObject& o, const char* key, int low, int high, int& dest
     dest = int(value);
     return true;
 }
-bool readSteps(const QJsonArray& source, std::vector<Step>& steps, int count) {
+bool readSteps(const QJsonArray& source, std::vector<Step>& steps, int count, bool chords = false) {
     if (source.size() != count)
         return false;
     steps.assign(count, {});
     for (int s = 0; s < count; ++s) {
-        if (!source[s].isObject())
+        if (chords ? !source[s].isArray() : !source[s].isObject())
             return false;
-        auto obj = source[s].toObject();
-        if (!number(obj, "velocity", 0, 1, steps[s].velocity) ||
-            !integer(obj, "note", 0, 127, steps[s].note))
+        const auto notes = chords ? source[s].toArray() : QJsonArray{source[s]};
+        if (notes.size() > MaxNotesPerStep)
             return false;
+        std::set<int> pitches;
+        for (const auto& value : notes) {
+            if (!value.isObject())
+                return false;
+            const auto obj = value.toObject();
+            Note note;
+            if (!number(obj, "velocity", 0, 1, note.velocity) ||
+                !integer(obj, "note", 0, 127, note.note) || !pitches.insert(note.note).second)
+                return false;
+            steps[s].notes.push_back(note);
+        }
     }
     return true;
 }
-uint64_t eventIdentity(int track, uint64_t clip, int step) {
+uint64_t eventIdentity(int track, uint64_t clip, int step, int voice = 0) {
     // SplitMix64 keeps noise seeds stable when unrelated clips are edited or inserted.
     uint64_t value = clip ^ (uint64_t(track + 1) << 56) ^ (uint64_t(step + 1) * 0x9e3779b97f4a7c15ULL);
+    // Keep legacy single-note noise seeds; extra pitches get distinct, stable seeds.
+    value ^= uint64_t(voice) * 0xd6e8feb86659fd93ULL;
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
     value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
     return value ^ (value >> 31);
@@ -107,9 +119,13 @@ std::vector<ScheduledStep> scheduledSteps(const Project& p, int trackIndex) {
             if (absoluteStep < 0)
                 continue;
             const auto& step = pattern.steps[size_t(local) % pattern.steps.size()];
-            if (step.velocity <= 0)
-                continue;
-            events.push_back({frameAtStep(p, absoluteStep), step, eventIdentity(trackIndex, clip.id, local)});
+            for (size_t n = 0; n < step.notes.size(); ++n) {
+                const auto& note = step.notes[n];
+                if (note.velocity <= 0)
+                    continue;
+                events.push_back({frameAtStep(p, absoluteStep), note,
+                                  eventIdentity(trackIndex, clip.id, local, n == 0 ? 0 : note.note + 1)});
+            }
         }
     }
     std::stable_sort(events.begin(), events.end(), [](const auto& a, const auto& b) { return a.frame < b.frame; });
@@ -195,8 +211,12 @@ QJsonObject projectToJson(const Project& p) {
         QJsonArray patterns, clips;
         for (const auto& pattern : t.patterns) {
             QJsonArray steps;
-            for (const auto& s : pattern.steps)
-                steps.append(QJsonObject{{"velocity", s.velocity}, {"note", s.note}});
+            for (const auto& s : pattern.steps) {
+                QJsonArray notes;
+                for (const auto& note : s.notes)
+                    notes.append(QJsonObject{{"velocity", note.velocity}, {"note", note.note}});
+                steps.append(notes);
+            }
             patterns.append(QJsonObject{{"name", pattern.name}, {"bars", pattern.bars}, {"steps", steps}});
         }
         for (const auto& clip : t.clips)
@@ -207,14 +227,14 @@ QJsonObject projectToJson(const Project& p) {
                                   {"mute", t.mute}, {"solo", t.solo}, {"sample", t.samplePath},
                                   {"patterns", patterns}, {"clips", clips}});
     }
-    return {{"format", "ferro-project"}, {"version", 2}, {"title", p.title}, {"bpm", p.bpm},
+    return {{"format", "ferro-project"}, {"version", 3}, {"title", p.title}, {"bpm", p.bpm},
             {"master", p.master}, {"delay", p.delay}, {"duck", p.duck}, {"metronome", p.metronome},
             {"songBars", p.songBars}, {"tailSeconds", p.tailSeconds}, {"tracks", tracks}};
 }
 bool projectFromJson(const QJsonObject& o, Project& out, QString& error) {
     auto fail = [&](const QString& message) { error = message; return false; };
     int version = 0;
-    if (o.value("format") != "ferro-project" || !integer(o, "version", 1, 2, version))
+    if (o.value("format") != "ferro-project" || !integer(o, "version", 1, 3, version))
         return fail("Unsupported project format/version.");
     Project p;
     if (!o.value("title").isString() || o.value("title").toString().size() > 256)
@@ -261,7 +281,7 @@ bool projectFromJson(const QJsonObject& o, Project& out, QString& error) {
         t.name = obj.value("name").toString();
         t.samplePath = obj.value("sample").toString();
         t.instrument = i;
-        if (version == 2 && !integer(obj, "instrument", 0, TrackCount - 1, t.instrument))
+        if (version >= 2 && !integer(obj, "instrument", 0, TrackCount - 1, t.instrument))
             return fail("Invalid instrument.");
         if (!number(obj, "volume", 0, 1.5, t.volume) || !number(obj, "pan", -1, 1, t.pan) ||
             !number(obj, "tone", 0, 1, t.tone) || !number(obj, "decay", 0, 1, t.decay) ||
@@ -292,8 +312,8 @@ bool projectFromJson(const QJsonObject& o, Project& out, QString& error) {
                     return fail("Phrase names must fit 80 characters and phrase lengths must be 1–16 bars.");
                 pattern.name = source.value("name").toString();
                 if (!source.value("steps").isArray() ||
-                    !readSteps(source.value("steps").toArray(), pattern.steps, pattern.bars * Steps))
-                    return fail("Invalid phrase step count, velocity or MIDI note.");
+                    !readSteps(source.value("steps").toArray(), pattern.steps, pattern.bars * Steps, version >= 3))
+                    return fail("Invalid phrase steps: expected unique MIDI notes (0–127) with velocity 0–1.");
             }
             t.patterns.push_back(std::move(pattern));
         }

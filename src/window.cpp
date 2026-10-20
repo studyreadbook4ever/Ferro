@@ -57,6 +57,23 @@ QString timecode(uint64_t frames) {
         .arg(ms / 1000 % 60, 2, 10, QChar('0'))
         .arg(ms % 1000, 3, 10, QChar('0'));
 }
+bool prepareSamplePitches(Track& track) {
+    for (const auto& pattern : track.patterns)
+        for (const auto& step : pattern.steps)
+            if (std::count_if(step.notes.begin(), step.notes.end(),
+                              [](const Note& note) { return note.velocity > 0; }) > 1)
+                return true;
+    for (auto& pattern : track.patterns)
+        for (auto& step : pattern.steps) {
+            auto active = std::find_if(step.notes.begin(), step.notes.end(),
+                                       [](const Note& note) { return note.velocity > 0; });
+            if (active == step.notes.end())
+                step.notes.clear();
+            else
+                step.notes = {{active->velocity, 60}};
+        }
+    return false;
+}
 } // namespace
 Window::Window(bool mode) : supervisor(this), smoke(mode) {
     setObjectName("ferroWindow");
@@ -189,7 +206,8 @@ void Window::build() {
             "body: move (also between tracks)\nCtrl-drag: copy a clip\nDrag clip right edge: repeat its "
             "phrase\nRight-click clip: duplicate, make independent, delete\nClick timeline ruler: seek\nDrag "
             "END marker or set Song bars: song length\n\nSelect a clip to edit notes below.\nClick / drag: "
-            "draw notes; right-drag: erase.\nOne note per sixteenth-note step. Scroll: change pitch "
+            "draw notes; right-drag: erase individual notes.\nStack pitches in a sixteenth-note step to make "
+            "chords. Click an existing note to select it. Scroll: change pitch "
             "range.\nCopies on the same track share a phrase. Make independent for variations.\n\nSpace: "
             "Play / pause   Home: Stop and rewind\nCtrl+S: Save   Ctrl+E: Export entire song once\nLoop is "
             "optional and off by default.\nExport includes the ending tail and does not use transport Loop.");
@@ -379,6 +397,7 @@ void Window::build() {
     auto* unique = button("Make independent", "Give this clip its own editable notes");
     phraseRow->addWidget(unique);
     auto* clear = button("Clear notes", "Clear the selected phrase; shared clips follow this edit");
+    clear->setObjectName("clearNotes");
     phraseRow->addWidget(clear);
     auto* fitNotes = button("Fit notes");
     phraseRow->addWidget(fitNotes);
@@ -415,7 +434,7 @@ void Window::build() {
     connect(clear, &QPushButton::clicked, this, [this] {
         if (auto* p = editor->phrase()) {
             for (auto& s : p->steps)
-                s.velocity = 0;
+                s.notes.clear();
             refreshSelection();
             change();
         }
@@ -524,6 +543,7 @@ void Window::build() {
     pitchRow->addWidget(caption("PITCH"));
     note = new QSpinBox;
     note->setRange(0, 127);
+    note->setKeyboardTracking(false);
     pitchRow->addWidget(note);
     noteLabel = new QLabel;
     pitchRow->addWidget(noteLabel);
@@ -539,8 +559,25 @@ void Window::build() {
     connect(note, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
         noteLabel->setText(noteName(value));
         if (!updating)
-            if (auto* p = editor->phrase()) {
-                p->steps[editor->step].note = value;
+            if (auto* selected = editor->selectedNote()) {
+                auto& notes = editor->phrase()->steps[editor->step].notes;
+                if (std::any_of(notes.begin(), notes.end(), [selected, value](const Note& other) {
+                        return &other != selected && other.note == value && other.velocity > 0;
+                    })) {
+                    refreshSelection();
+                    report("That pitch already has a note in this step. Select it to edit.");
+                    return;
+                }
+                if (selected->note != value) {
+                    notes.erase(std::remove_if(notes.begin(), notes.end(),
+                                               [value](const Note& other) {
+                                                   return other.note == value && other.velocity <= 0;
+                                               }),
+                                notes.end());
+                    selected = editor->selectedNote();
+                }
+                selected->note = value;
+                editor->selectedPitch = value;
                 editor->update();
                 timeline->update();
                 change();
@@ -548,8 +585,8 @@ void Window::build() {
     });
     connect(velocity, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
         if (!updating)
-            if (auto* p = editor->phrase()) {
-                p->steps[editor->step].velocity = value / 127.;
+            if (auto* selected = editor->selectedNote()) {
+                selected->velocity = value / 127.;
                 editor->update();
                 timeline->update();
                 change();
@@ -594,16 +631,10 @@ void Window::refreshSelection() {
     auto* p = editor->phrase();
     phraseName->setEnabled(p);
     phraseLength->setEnabled(p);
-    note->setEnabled(p);
-    velocity->setEnabled(p);
     if (p) {
         editor->step = std::clamp(editor->step, 0, int(p->steps.size()) - 1);
         phraseName->setText(p->name);
         phraseLength->setValue(p->bars);
-        auto& s = p->steps[editor->step];
-        note->setValue(s.note);
-        noteLabel->setText(noteName(s.note));
-        velocity->setValue(int(std::round(s.velocity * 127)));
         int count = 0;
         for (auto& c : tr.clips)
             if (c.pattern == clip->pattern)
@@ -617,8 +648,13 @@ void Window::refreshSelection() {
         phraseName->clear();
         phraseName->setPlaceholderText("Select or create a clip");
         clipInfo->setText("DOUBLE-CLICK EMPTY TRACK SPACE TO CREATE A CLIP");
-        noteLabel->setText("—");
     }
+    auto* selected = editor->selectedNote();
+    note->setEnabled(selected);
+    velocity->setEnabled(selected);
+    note->setValue(selected ? selected->note : editor->defaultNote());
+    noteLabel->setText(selected ? noteName(selected->note) : "—");
+    velocity->setValue(selected ? int(std::round(selected->velocity * 127)) : 0);
     trackName->setText(tr.name);
     instrument->setCurrentIndex(tr.instrument);
     trackTitle->setText(tr.samplePath.isEmpty() ? "INSTRUMENT" : "SAMPLE");
@@ -917,12 +953,14 @@ void Window::importSample() {
     }
     auto& tr = project.tracks[timeline->track];
     tr.samplePath = path;
-    for (auto& p : tr.patterns)
-        for (auto& s : p.steps)
-            s.note = 60;
+    bool preservedChords = prepareSamplePitches(tr);
+    if (!preservedChords && editor->selectedPitch >= 0)
+        editor->selectedPitch = 60;
     editor->fitNotes();
     refreshSelection();
     change();
+    if (preservedChords)
+        report("Sample loaded; chord pitches preserved (sample root C4).");
 }
 void Window::exportWave() {
     if (exportBusy) {
@@ -996,23 +1034,73 @@ int Window::smokeTest(const QString& screenshot) {
     check(project.tracks[2].clips.size() == 1, "double click creates timeline clip");
     check(editor->phrase() != nullptr, "new clip opens note editor");
     double rh = (editor->height() - 24.) / 24;
-    int targetNote = 64;
-    QPoint onset(64 + int((editor->width() - 64.) / 16 * .5),
-                 int(24 + (editor->baseNote + 23 - targetNote + .5) * rh));
-    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, onset);
-    check(editor->phrase() && editor->phrase()->steps[0].note == 64 &&
-              editor->phrase()->steps[0].velocity > 0,
-          "draw note in clip");
-    note->setValue(67);
+    auto noteAt = [&](int pitch) {
+        return QPoint(64 + int((editor->width() - 64.) / 16 * .5),
+                      int(24 + (editor->baseNote + 23 - pitch + .5) * rh));
+    };
+    auto voice = [&](int pitch) -> const Note* {
+        if (!editor->phrase())
+            return nullptr;
+        const auto& notes = editor->phrase()->steps[0].notes;
+        auto found =
+            std::find_if(notes.begin(), notes.end(), [pitch](const Note& n) { return n.note == pitch; });
+        return found == notes.end() ? nullptr : &*found;
+    };
+    check(!note->isEnabled() && !velocity->isEnabled(), "empty step has no selected note to edit");
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(64));
+    check(voice(64) && voice(64)->velocity > 0, "draw note in clip");
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(60));
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(67));
+    check(editor->phrase()->steps[0].notes.size() == 3 && voice(60) && voice(64) && voice(67),
+          "stack three simultaneous pitches without replacing notes");
+    auto beforeSelection = projectToJson(project);
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(64));
+    check(editor->selectedPitch == 64 && note->value() == 64 && projectToJson(project) == beforeSelection,
+          "clicking a chord tone selects exactly that note without editing");
+    note->setValue(65);
     velocity->setValue(88);
-    check(editor->phrase()->steps[0].note == 67, "note inspector");
-    check(std::abs(editor->phrase()->steps[0].velocity - 88. / 127) < .0001, "velocity inspector");
-    int eraseNote = editor->phrase()->steps[0].note;
-    QPoint eraseAt(onset.x(), int(24 + (editor->baseNote + 23 - eraseNote + .5) * rh));
-    QTest::mouseClick(editor, Qt::RightButton, Qt::NoModifier, eraseAt);
-    check(editor->phrase()->steps[0].velocity == 0, "right-click erases a note");
+    check(voice(65) && !voice(64) && voice(60) && voice(67),
+          "pitch inspector edits only selected chord tone");
+    check(voice(65) && std::abs(voice(65)->velocity - 88. / 127) < .0001 && voice(60) &&
+              std::abs(voice(60)->velocity - 100. / 127) < .0001 && voice(67) &&
+              std::abs(voice(67)->velocity - 100. / 127) < .0001,
+          "velocity inspector preserves sibling chord tones");
+    auto beforeCollision = projectToJson(project);
+    note->setValue(67);
+    check(note->value() == 65 && editor->selectedPitch == 65 && projectToJson(project) == beforeCollision,
+          "pitch collision is rejected without losing either chord tone");
+    velocity->setValue(0);
+    check(voice(65) && voice(65)->velocity == 0 && velocity->isEnabled(),
+          "zero velocity retains the selected note for editing");
+    velocity->setValue(88);
+    QTest::mouseClick(editor, Qt::RightButton, Qt::NoModifier, noteAt(62));
+    check(editor->phrase()->steps[0].notes.size() == 3, "erasing an empty pitch preserves its chord");
+    QTest::mouseClick(editor, Qt::RightButton, Qt::NoModifier, noteAt(65));
+    check(!voice(65) && voice(60) && voice(67) && editor->phrase()->steps[0].notes.size() == 2,
+          "right-click erases only the targeted chord tone");
     undo(-1);
-    check(editor->phrase()->steps[0].velocity > 0, "undo restores an erased note");
+    check(voice(65) && voice(60) && voice(67) && editor->phrase()->steps[0].notes.size() == 3,
+          "undo restores an erased chord tone and its siblings");
+    auto* clearNotes = findChild<QPushButton*>("clearNotes");
+    check(clearNotes != nullptr, "clear notes control exists");
+    if (clearNotes)
+        clearNotes->click();
+    check(editor->phrase()->steps[0].notes.empty() && !note->isEnabled(),
+          "clear notes removes every chord tone and clears inspector");
+    undo(-1);
+    check(voice(65) && voice(60) && voice(67), "undo clear restores the full chord");
+    auto& withPlaceholder = editor->phrase()->steps[0].notes;
+    withPlaceholder.insert(withPlaceholder.begin(), Note{0, 64});
+    change();
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(65));
+    note->setValue(64);
+    check(voice(64) && std::abs(voice(64)->velocity - 88. / 127) < .0001 && !voice(65) && voice(60) &&
+              voice(67) && editor->phrase()->steps[0].notes.size() == 3 && editor->selectedPitch == 64,
+          "retuning replaces a silent legacy placeholder while preserving active siblings");
+    beforeCollision = projectToJson(project);
+    note->setValue(60);
+    check(note->value() == 64 && projectToJson(project) == beforeCollision,
+          "retuning still rejects an active sibling after replacing a silent placeholder");
     auto drag = [&](QPoint from, QPoint to, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
         QTest::mousePress(timeline, Qt::LeftButton, modifiers, from);
         QTest::mouseMove(timeline, to, 20);
@@ -1064,8 +1152,11 @@ int Window::smokeTest(const QString& screenshot) {
         Timeline scratch(names);
         scratch.createClip(0, 0);
         check(names.tracks[0].patterns.size() == 5, "creating a clip preserves unused imported phrases");
-        check(names.tracks[0].patterns.back().steps[0].note == 60,
-              "sample clips start at original sample pitch");
+        NoteEditor sampleEditor(names);
+        sampleEditor.select(0, int(names.tracks[0].patterns.size()) - 1);
+        check(sampleEditor.defaultNote() == 60 && sampleEditor.baseNote == 60 &&
+                  names.tracks[0].patterns.back().steps[0].notes.empty(),
+              "empty sample clips open at original sample pitch");
         names.tracks[0].patterns.back().name = QString(80, 'p');
         scratch.makeIndependent();
         scratch.insertPhrase(0, 4, 1);
@@ -1076,6 +1167,22 @@ int Window::smokeTest(const QString& screenshot) {
         scratch.deleteSelected();
         check(names.tracks[0].patterns.size() == 6, "deleting a clip preserves stored phrases");
     }
+    {
+        Track sampleTrack;
+        sampleTrack.patterns.resize(1);
+        sampleTrack.patterns[0].steps[0].notes = {{.8, 60}, {.6, 64}, {.7, 67}};
+        sampleTrack.patterns[0].steps[1].notes = {{.5, 72}};
+        check(prepareSamplePitches(sampleTrack) && sampleTrack.patterns[0].steps[0].notes.size() == 3 &&
+                  sampleTrack.patterns[0].steps[0].notes[1].note == 64 &&
+                  sampleTrack.patterns[0].steps[0].notes[2].note == 67 &&
+                  sampleTrack.patterns[0].steps[1].notes[0].note == 72,
+              "sample import preserves chord intervals and all other pitches");
+        sampleTrack.patterns[0].steps[0].notes = {{.8, 36}, {0, 40}};
+        check(!prepareSamplePitches(sampleTrack) && sampleTrack.patterns[0].steps[0].notes.size() == 1 &&
+                  sampleTrack.patterns[0].steps[0].notes[0].note == 60 &&
+                  sampleTrack.patterns[0].steps[1].notes[0].note == 60,
+              "monophonic sample import retains original pitch behavior without duplicates");
+    }
     QString error;
     QDir().mkpath("artifacts");
     check(saveProject("artifacts/gui-song.ferro", project, error), "save timeline song");
@@ -1083,6 +1190,8 @@ int Window::smokeTest(const QString& screenshot) {
     check(loadProject("artifacts/gui-song.ferro", loaded, error) &&
               projectToJson(loaded) == projectToJson(project),
           "timeline save roundtrip");
+    check(!loaded.tracks[2].patterns.empty() && loaded.tracks[2].patterns[0].steps[0].notes.size() == 3,
+          "timeline save roundtrip retains all chord tones");
     check(!loop->isChecked() && !audio.looping(), "song transport loop defaults off");
     title->setFocus();
     QTest::keyClicks(title, " a b");
