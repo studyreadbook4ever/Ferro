@@ -82,6 +82,7 @@ class Window : public QMainWindow {
     void newSession(bool demo);
     void exportWave();
     bool confirmDiscard();
+    void clearAllNotes();
     bool confirmNoteDeletion(int count, const QString& reason);
     void moveNote();
     void report(const QString& message);
