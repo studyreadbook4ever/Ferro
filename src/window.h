@@ -84,6 +84,7 @@ class Window : public QMainWindow {
     bool confirmDiscard();
     void clearAllNotes();
     bool confirmNoteDeletion(int count, const QString& reason);
+    bool confirmDeletion(const QString& dialogTitle, const QString& message, const QString& actionText);
     void moveNote();
     void report(const QString& message);
     void importSample();

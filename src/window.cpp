@@ -272,8 +272,8 @@ void Window::build() {
     logo->setStyleSheet("font-size:24px;font-weight:700;color:#e1c8a2;");
     top->addWidget(logo);
     top->addWidget(caption("SONG STUDIO"));
-    auto* clearAll =
-        button("Clear all notes", "Delete notes from all six tracks, including unused phrases; Ctrl+Z to undo");
+    auto* clearAll = button("Clear all notes",
+                            "Reset all six tracks by deleting every clip, phrase and note; Ctrl+Z to undo");
     clearAll->setObjectName("clearAllNotes");
     top->addWidget(clearAll);
     top->addStretch();
@@ -922,38 +922,55 @@ void Window::resizePhrase(int bars) {
     change();
 }
 void Window::clearAllNotes() {
-    int count = 0;
-    for (const auto& track : project.tracks)
+    int notes = 0, clips = 0, phrases = 0;
+    for (const auto& track : project.tracks) {
+        clips += int(track.clips.size());
+        phrases += int(track.patterns.size());
         for (const auto& pattern : track.patterns)
             for (const auto& step : pattern.steps)
-                count += int(step.notes.size());
-    if (count == 0 ||
-        !confirmNoteDeletion(count, "Clear all notes in all six tracks, including unused phrases"))
+                notes += int(step.notes.size());
+    }
+    if (clips == 0 && phrases == 0)
         return;
-    for (auto& track : project.tracks)
-        for (auto& pattern : track.patterns)
-            for (auto& step : pattern.steps)
-                step.notes.clear();
-    refreshSelection();
+    if (!confirmDeletion("Clear song arrangement?",
+                         QString("Delete all clips, phrases and notes from all six tracks?\n\n"
+                                 "Clips: %1 · Phrases: %2 · Notes: %3\n"
+                                 "Unused phrases and silent notes will also be removed.\n"
+                                 "Instrument and mix settings are kept.\n"
+                                 "You can undo this reset with Ctrl+Z.")
+                             .arg(clips)
+                             .arg(phrases)
+                             .arg(notes),
+                         "Clear arrangement"))
+        return;
+    for (auto& track : project.tracks) {
+        track.clips.clear();
+        track.patterns.clear();
+    }
+    refreshProject();
     change();
 }
 bool Window::confirmNoteDeletion(int count, const QString& reason) {
     if (count <= 0)
         return true;
+    return confirmDeletion("Delete notes?",
+                           QString("%1\n\nDelete %2 note%3 and their pitch, velocity and sound settings?\n"
+                                   "Clips using the affected phrases will also change.\n"
+                                   "You can undo this deletion with Ctrl+Z.")
+                               .arg(reason)
+                               .arg(count)
+                               .arg(count == 1 ? "" : "s"),
+                           "Delete notes");
+}
+bool Window::confirmDeletion(const QString& dialogTitle, const QString& message, const QString& actionText) {
     const auto before = projectToJson(project);
     const int trackBefore = timeline->track, editorTrack = editor->track, patternBefore = editor->pattern,
               stepBefore = editor->step, pitchBefore = editor->selectedPitch;
     const uint64_t clipBefore = timeline->selectedClip;
-    QMessageBox dialog(QMessageBox::Warning, "Delete notes?",
-                       QString("%1\n\nDelete %2 note%3 and their pitch, velocity and sound settings?\n"
-                               "Clips using the affected phrases will also change.\n"
-                               "You can undo this deletion with Ctrl+Z.")
-                           .arg(reason)
-                           .arg(count)
-                           .arg(count == 1 ? "" : "s"),
-                       QMessageBox::Discard | QMessageBox::Cancel, this);
-    dialog.setObjectName("confirmNoteDeletion");
-    dialog.button(QMessageBox::Discard)->setText("Delete notes");
+    QMessageBox dialog(QMessageBox::Warning, dialogTitle, message, QMessageBox::Discard | QMessageBox::Cancel,
+                       this);
+    dialog.setObjectName("confirmDeletion");
+    dialog.button(QMessageBox::Discard)->setText(actionText);
     dialog.setDefaultButton(QMessageBox::Cancel);
     dialog.setEscapeButton(QMessageBox::Cancel);
     if (dialog.exec() != QMessageBox::Discard)
@@ -962,7 +979,7 @@ bool Window::confirmNoteDeletion(int count, const QString& reason) {
         timeline->selectedClip != clipBefore || editor->track != editorTrack ||
         editor->pattern != patternBefore || editor->step != stepBefore ||
         editor->selectedPitch != pitchBefore) {
-        report("The song or selection changed. Review the notes and try deleting again.");
+        report("The song or selection changed. Review it and try deleting again.");
         return false;
     }
     return true;
@@ -1536,7 +1553,7 @@ int Window::smokeTest(const QString& screenshot) {
     QTimer deletionResponder;
     connect(&deletionResponder, &QTimer::timeout, this, [&] {
         auto* dialog = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
-        if (!dialog || dialog->objectName() != "confirmNoteDeletion")
+        if (!dialog || dialog->objectName() != "confirmDeletion")
             return;
         ++deletionDialogs;
         check(dialog->defaultButton() == dialog->button(QMessageBox::Cancel),
@@ -1601,6 +1618,7 @@ int Window::smokeTest(const QString& screenshot) {
             project.title = "Clear all notes fixture";
             project.bpm = 133;
             project.delay = .27;
+            const auto cleared = projectToJson(project);
             for (int t = 0; t < TrackCount; ++t) {
                 auto& track = project.tracks[t];
                 track.patterns = {Pattern{}, Pattern{}};
@@ -1610,7 +1628,6 @@ int Window::smokeTest(const QString& screenshot) {
                 track.patterns[1].name = "Unused phrase";
                 track.clips = {{uint64_t(t * 2 + 1), 0, 0, 4}, {uint64_t(t * 2 + 2), 0, 8, 2}};
             }
-            const auto cleared = projectToJson(project);
             for (auto& track : project.tracks) {
                 track.patterns[0].steps[0].notes = {{.8, 60}, {.6, 64}};
                 track.patterns[0].steps.back().notes = {{.5, 67}};
@@ -1631,9 +1648,11 @@ int Window::smokeTest(const QString& screenshot) {
             answerDeletion(false);
             QTimer::singleShot(0, this, [&] {
                 auto* dialog = qobject_cast<QMessageBox*>(QApplication::activeModalWidget());
-                check(dialog && dialog->text().contains("Delete 24 notes") &&
-                          dialog->text().contains("all six tracks"),
-                      "clear all warning counts stored notes once, including unused silent notes");
+                check(
+                    dialog && dialog->text().contains("Clips: 12") &&
+                        dialog->text().contains("Phrases: 12") && dialog->text().contains("Notes: 24") &&
+                        dialog->text().contains("all six tracks"),
+                    "clear all warning counts clips, phrases and stored notes including unused silent notes");
             });
             clearAll->click();
             check(projectToJson(project) == before && historyIndex == 0 && history.size() == 1 && !dirty,
@@ -1641,19 +1660,54 @@ int Window::smokeTest(const QString& screenshot) {
             answerDeletion(true);
             clearAll->click();
             check(projectToJson(project) == cleared && historyIndex == 1 && history.size() == 2 && dirty &&
+                      timeline->selectedClip == 0 && !editor->phrase() && !phraseName->isEnabled() &&
                       !note->isEnabled() && !velocity->isEnabled() && !noteSoundReset->isEnabled(),
-                  "clear all removes every note, preserves song structure and mix, and clears inspector");
+                  "clear all removes clips and phrases, preserves song settings, and clears selection");
             const int dialogsAfterClear = deletionDialogs;
             clearAll->click();
             check(projectToJson(project) == cleared && historyIndex == 1 && history.size() == 2 &&
                       deletionDialogs == dialogsAfterClear,
-                  "clear all on a song without notes has no dialog or extra Undo step");
+                  "clear all on a song without clips or phrases has no dialog or extra Undo step");
             undo(-1);
-            check(projectToJson(project) == before && historyIndex == 0 && !dirty && note->isEnabled(),
-                  "one Undo restores all tracks, unused silent notes and sound overrides exactly");
+            check(projectToJson(project) == before && historyIndex == 0 && !dirty,
+                  "one Undo restores all clips, phrases, unused silent notes and sound overrides exactly");
             undo(1);
             check(projectToJson(project) == cleared && historyIndex == 1 && dirty,
-                  "one Redo clears all notes again");
+                  "one Redo clears all clips and phrases again");
+            timeline->createClip(2, 0);
+            check(project.tracks[2].clips.size() == 1 && project.tracks[2].patterns.size() == 1 &&
+                      editor->phrase() && editor->phrase()->steps[0].notes.empty(),
+                  "a fresh clip can be created and selected immediately after reset");
+            undo(-1);
+            check(projectToJson(project) == cleared,
+                  "undoing the fresh clip returns to the cleared arrangement");
+            for (bool withClip : {true, false}) {
+                project = emptyProject();
+                const auto empty = projectToJson(project);
+                project.tracks[2].patterns.emplace_back();
+                if (withClip)
+                    project.tracks[2].clips.push_back({1, 0, 3, 1});
+                resetHistory();
+                dirty = false;
+                refreshProject();
+                const auto silentArrangement = projectToJson(project);
+                const int dialogsBefore = deletionDialogs;
+                answerDeletion(false);
+                clearAll->click();
+                check(projectToJson(project) == silentArrangement && !dirty && historyIndex == 0 &&
+                          deletionDialogs == dialogsBefore + 1,
+                      "canceling a reset with no notes preserves empty clips and unused empty phrases");
+                answerDeletion(true);
+                clearAll->click();
+                check(projectToJson(project) == empty && historyIndex == 1 && history.size() == 2 && dirty,
+                      "reset also removes empty clips and unused empty phrases when no notes exist");
+                undo(-1);
+                check(projectToJson(project) == silentArrangement && !dirty,
+                      "one Undo restores an arrangement containing no notes");
+                undo(1);
+                check(projectToJson(project) == empty && dirty,
+                      "one Redo clears the arrangement containing no notes");
+            }
         }
     }
     // Offscreen modal dialogs can leave no active window for later keyboard tests.
