@@ -17,6 +17,7 @@ class QPlainTextEdit;
 class QCheckBox;
 class QComboBox;
 class QScrollArea;
+class QScrollBar;
 class QAction;
 namespace fc {
 class Window : public QMainWindow {
@@ -45,6 +46,7 @@ class Window : public QMainWindow {
     Timeline* timeline = nullptr;
     NoteEditor* editor = nullptr;
     QScrollArea *timelineScroll = nullptr, *editorScroll = nullptr;
+    QScrollBar* pitchScroll = nullptr;
     QTimer* renderTimer = nullptr;
     QLabel *clock = nullptr, *barClock = nullptr, *engineState = nullptr, *trackTitle = nullptr,
            *noteLabel = nullptr, *meterLabel = nullptr, *renderState = nullptr, *clipInfo = nullptr;
@@ -59,6 +61,8 @@ class Window : public QMainWindow {
     QCheckBox *click = nullptr, *loop = nullptr;
     std::array<QCheckBox*, 5> noteSoundOverride{};
     std::array<QSpinBox*, 5> noteSoundValue{};
+    std::array<QSpinBox*, 5> trackSoundValue{};
+    std::array<QSpinBox*, 3> masterSoundValue{};
     QPushButton* noteSoundReset = nullptr;
     QPushButton* moveNoteButton = nullptr;
     QAction* moveNoteAction = nullptr;

@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
         app = std::make_unique<QCoreApplication>(argc, argv);
     app->setApplicationName("ferro");
     app->setOrganizationName("Ferro");
-    app->setApplicationVersion("2.2.0");
+    app->setApplicationVersion("2.2.1");
     QStringList args = app->arguments();
     try {
         if (args.contains("--worker"))

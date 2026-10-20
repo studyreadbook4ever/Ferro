@@ -60,9 +60,12 @@ class NoteEditor : public QWidget {
     double playStep = -1;
     std::function<void(bool)> edited;
     std::function<bool(int)> confirmErase;
+    std::function<void(int)> pitchRangeChanged;
     void select(int track, int pattern);
     void refresh();
     void fitNotes();
+    void setBaseNote(int midi);
+    void ensureNoteVisible(int midi);
     Pattern* phrase();
     Note* selectedNote();
     bool moveSelectedNote(int targetStep);
@@ -80,6 +83,7 @@ class NoteEditor : public QWidget {
     bool drawing = false, deleting = false, changed = false;
     int lastStep = -1, lastNote = -1;
     int gestureTrack = -1, gesturePattern = -1;
+    int wheelAngleRemainder = 0, wheelPixelRemainder = 0;
     std::set<std::pair<int, int>> pendingErase;
     void drawAt(QPoint, bool press = false, bool selectOnly = false);
 };

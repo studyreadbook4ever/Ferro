@@ -556,6 +556,7 @@ void NoteEditor::select(int t, int p) {
     if (different) {
         drawing = deleting = false;
         pendingErase.clear();
+        wheelAngleRemainder = wheelPixelRemainder = 0;
     }
     track = t;
     pattern = p;
@@ -582,8 +583,26 @@ void NoteEditor::fitNotes() {
                 lo = std::min(lo, n.note);
     if (lo == 128)
         lo = defaultNote();
-    baseNote = std::clamp((lo / 12) * 12, 0, 104);
+    setBaseNote((lo / 12) * 12);
+}
+void NoteEditor::setBaseNote(int midi) {
+    const int next = std::clamp(midi, 0, 104);
+    if (baseNote == next)
+        return;
+    baseNote = next;
+    // A stationary cursor can now point to a different pitch during a stroke.
+    // Pending deletions keep their original absolute step/pitch coordinates.
+    lastStep = lastNote = -1;
     update();
+    if (pitchRangeChanged)
+        pitchRangeChanged(baseNote);
+}
+void NoteEditor::ensureNoteVisible(int midi) {
+    midi = std::clamp(midi, 0, 127);
+    if (midi < baseNote)
+        setBaseNote(midi);
+    else if (midi >= baseNote + 24)
+        setBaseNote(midi - 23);
 }
 void NoteEditor::refresh() {
     auto* p = phrase();
@@ -752,8 +771,33 @@ void NoteEditor::mouseReleaseEvent(QMouseEvent*) {
     update();
 }
 void NoteEditor::wheelEvent(QWheelEvent* e) {
-    baseNote = std::clamp(baseNote + (e->angleDelta().y() > 0 ? 1 : -1), 0, 104);
-    update();
+    const int pixelY = e->pixelDelta().y(), angleY = e->angleDelta().y();
+    if (pixelY == 0 && angleY == 0) {
+        // Let the enclosing scroll area handle horizontal navigation.
+        e->ignore();
+        return;
+    }
+    const int delta = pixelY != 0 ? pixelY : angleY;
+    if ((baseNote == 0 && delta < 0) || (baseNote == 104 && delta > 0)) {
+        wheelAngleRemainder = wheelPixelRemainder = 0;
+        e->accept();
+        return;
+    }
+    // A normal wheel notch is 120 angle units: move three semitones.
+    // Trackpads use pixel deltas instead, accumulated at 12 px per semitone.
+    const int threshold = pixelY != 0 ? 12 : 40;
+    int& remainder = pixelY != 0 ? wheelPixelRemainder : wheelAngleRemainder;
+    if (pixelY != 0)
+        wheelAngleRemainder = 0;
+    else
+        wheelPixelRemainder = 0;
+    const int64_t total = int64_t(remainder) + delta;
+    const int semitones = int(total / threshold);
+    remainder = int(total % threshold);
+    if (semitones != 0)
+        setBaseNote(baseNote + semitones);
+    if (semitones != 0 && (baseNote == 0 || baseNote == 104))
+        wheelAngleRemainder = wheelPixelRemainder = 0;
     e->accept();
 }
 } // namespace fc

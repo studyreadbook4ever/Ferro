@@ -33,6 +33,7 @@
 #include <QStatusBar>
 #include <QTest>
 #include <QTimer>
+#include <QWheelEvent>
 #include <QtConcurrent>
 #include <algorithm>
 #include <cmath>
@@ -227,9 +228,10 @@ void Window::build() {
             "Deletion asks for confirmation before removing notes and their settings.\n"
             "Move note… / Ctrl+Shift+M: move a selected note in time, keeping all settings.\nStack pitches "
             "in a "
-            "sixteenth-note step to make chords. Scroll: change pitch "
+            "sixteenth-note step to make chords. Mouse wheel or right scrollbar: change pitch "
             "range.\nNOTE SOUND: check a setting to override it on the selected note; uncheck to follow "
             "TRACK. Reset to track defaults clears all five note overrides.\n"
+            "TRACK / MASTER: drag sliders or type their numbers; Enter or leaving the field commits.\n"
             "Copies on the same track share a phrase. Make independent for variations.\n\nSpace: "
             "Play / pause   Home: Stop and rewind\nCtrl+S: Save   Ctrl+E: Export entire song once\nLoop is "
             "optional and off by default.\nExport includes the ending tail and does not use transport Loop.");
@@ -422,6 +424,7 @@ void Window::build() {
     clear->setObjectName("clearNotes");
     phraseRow->addWidget(clear);
     auto* fitNotes = button("Fit notes");
+    fitNotes->setObjectName("fitNotes");
     phraseRow->addWidget(fitNotes);
     clipInfo = caption("SELECT A CLIP");
     phraseRow->addStretch();
@@ -433,7 +436,26 @@ void Window::build() {
     editorScroll->setWidget(editor);
     editorScroll->setFixedHeight(276);
     editorScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    root->addWidget(editorScroll);
+    auto* editorRow = new QHBoxLayout;
+    editorRow->setSpacing(4);
+    editorRow->addWidget(editorScroll, 1);
+    pitchScroll = new QScrollBar(Qt::Vertical);
+    pitchScroll->setObjectName("pianoRollPitchScroll");
+    pitchScroll->setAccessibleName("Piano roll pitch range");
+    pitchScroll->setToolTip(
+        "Scroll up for higher notes and down for lower notes. One page spans 24 semitones.");
+    pitchScroll->setRange(0, 104);
+    pitchScroll->setSingleStep(1);
+    pitchScroll->setPageStep(24);
+    pitchScroll->setValue(104 - editor->baseNote);
+    editorRow->addWidget(pitchScroll);
+    root->addLayout(editorRow);
+    editor->pitchRangeChanged = [this](int baseNote) {
+        const QSignalBlocker block(pitchScroll);
+        pitchScroll->setValue(104 - baseNote);
+    };
+    connect(pitchScroll, &QScrollBar::valueChanged, editor,
+            [this](int value) { editor->setBaseNote(104 - value); });
     editor->edited = [this](bool modified) {
         refreshSelection();
         if (modified) {
@@ -493,40 +515,56 @@ void Window::build() {
     trackRow->addWidget(muteButton);
     trackRow->addWidget(soloButton);
     trackLayout->addLayout(trackRow);
-    auto control = [&](QBoxLayout* layout, const QString& name, QSlider*& slider, int lo, int hi, int value,
-                       std::function<void(int)> cb) {
+    auto control = [&](QBoxLayout* layout, const QString& scope, const QString& name, QSlider*& slider,
+                       QSpinBox*& number, int lo, int hi, int value, std::function<void(int)> cb) {
         auto* col = new QVBoxLayout;
         auto* row = new QHBoxLayout;
-        row->addWidget(caption(name));
-        auto* number = caption(QString::number(value));
+        auto* label = caption(name);
+        row->addWidget(label);
+        number = new QSpinBox;
+        number->setObjectName(scope + QString(name).remove(' ') + "Value");
+        number->setAccessibleName(scope.toUpper() + " " + name + " value");
+        number->setRange(lo, hi);
+        number->setValue(value);
+        number->setKeyboardTracking(false);
+        number->setMinimumWidth(64);
+        number->setMaximumWidth(76);
         number->setAlignment(Qt::AlignRight);
+        label->setBuddy(number);
         row->addWidget(number);
         col->addLayout(row);
         slider = new QSlider(Qt::Horizontal);
+        slider->setObjectName(scope + QString(name).remove(' ') + "Slider");
+        slider->setAccessibleName(scope.toUpper() + " " + name);
         slider->setRange(lo, hi);
         slider->setValue(value);
         slider->setMinimumWidth(90);
         col->addWidget(slider);
         layout->addLayout(col);
         connect(slider, &QSlider::valueChanged, this, [this, number, cb](int x) {
-            number->setText(QString::number(x));
+            {
+                const QSignalBlocker block(number);
+                number->setValue(x);
+            }
             if (!updating) {
                 cb(x);
                 refreshNoteSound();
                 change();
             }
         });
+        connect(number, qOverload<int>(&QSpinBox::valueChanged), slider,
+                [slider](int x) { slider->setValue(x); });
     };
     auto* sounds = new QHBoxLayout;
-    control(sounds, "LEVEL", volume, 0, 150, 75,
+    control(sounds, "track", "LEVEL", volume, trackSoundValue[0], 0, 150, 75,
             [this](int v) { project.tracks[timeline->track].volume = v / 100.; });
-    control(sounds, "PAN", pan, -100, 100, 0,
+    control(sounds, "track", "PAN", pan, trackSoundValue[1], -100, 100, 0,
             [this](int v) { project.tracks[timeline->track].pan = v / 100.; });
-    control(sounds, "TONE", tone, 0, 100, 50,
+    control(sounds, "track", "TONE", tone, trackSoundValue[2], 0, 100, 50,
             [this](int v) { project.tracks[timeline->track].tone = v / 100.; });
-    control(sounds, "DECAY", decay, 0, 100, 50,
+    control(sounds, "track", "DECAY", decay, trackSoundValue[3], 0, 100, 50,
             [this](int v) { project.tracks[timeline->track].decay = v / 100.; });
-    control(sounds, "DRIVE", drive, 0, 100, 20,
+    control(sounds, "track", "DRIVE", drive, trackSoundValue[4], 0, 100, 20,
             [this](int v) { project.tracks[timeline->track].drive = v / 100.; });
     trackLayout->addLayout(sounds);
     auto* sampleRow = new QHBoxLayout;
@@ -624,6 +662,7 @@ void Window::build() {
                 }
                 selected->note = value;
                 editor->selectedPitch = value;
+                editor->ensureNoteVisible(value);
                 editor->update();
                 timeline->update();
                 change();
@@ -640,9 +679,12 @@ void Window::build() {
     });
     auto* masterBox = new QGroupBox("MASTER");
     auto* ml = new QVBoxLayout(masterBox);
-    control(ml, "OUTPUT", master, 0, 100, 70, [this](int x) { project.master = x / 100.; });
-    control(ml, "DELAY", delay, 0, 100, 15, [this](int x) { project.delay = x / 100.; });
-    control(ml, "BASS DUCK", duck, 0, 100, 35, [this](int x) { project.duck = x / 100.; });
+    control(ml, "master", "OUTPUT", master, masterSoundValue[0], 0, 100, 70,
+            [this](int x) { project.master = x / 100.; });
+    control(ml, "master", "DELAY", delay, masterSoundValue[1], 0, 100, 15,
+            [this](int x) { project.delay = x / 100.; });
+    control(ml, "master", "BASS DUCK", duck, masterSoundValue[2], 0, 100, 35,
+            [this](int x) { project.duck = x / 100.; });
     bottom->addWidget(masterBox, 1);
     root->addLayout(bottom);
     auto* noteSoundBox = new QGroupBox("NOTE SOUND");
@@ -1287,6 +1329,61 @@ int Window::smokeTest(const QString& screenshot) {
     resetHistory();
     refreshProject();
     QTest::qWait(80);
+    const std::array<QSpinBox*, 8> editableSoundValues = {
+        trackSoundValue[0], trackSoundValue[1],  trackSoundValue[2],  trackSoundValue[3],
+        trackSoundValue[4], masterSoundValue[0], masterSoundValue[1], masterSoundValue[2]};
+    const std::array<QSlider*, 8> editableSoundSliders = {volume, pan,    tone,  decay,
+                                                          drive,  master, delay, duck};
+    const std::array<int, 8> typedSoundTargets = {150, -100, 0, 100, 0, 100, 0, 100};
+    auto typeNumber = [](QSpinBox* field, int value, bool commit = true) {
+        field->setFocus();
+        QTest::keyClick(field, Qt::Key_A, Qt::ControlModifier);
+        QTest::keyClicks(field, QString::number(value));
+        if (commit)
+            QTest::keyClick(field, Qt::Key_Return);
+    };
+    for (size_t i = 0; i < editableSoundValues.size(); ++i) {
+        const auto beforeTyping = projectToJson(project);
+        const int historyBefore = historyIndex;
+        const int previousValue = editableSoundSliders[i]->value();
+        typeNumber(editableSoundValues[i], typedSoundTargets[i], false);
+        check(projectToJson(project) == beforeTyping && editableSoundSliders[i]->value() == previousValue,
+              "typing a lower sound value does not edit the song before Enter or focus loss");
+        QTest::keyClick(editableSoundValues[i], Qt::Key_Return);
+        check(editableSoundValues[i]->value() == typedSoundTargets[i] &&
+                  editableSoundSliders[i]->value() == typedSoundTargets[i] &&
+                  historyIndex == historyBefore + 1,
+              "every lower sound field accepts typed boundary values with one undo entry");
+        const int midpoint = (editableSoundSliders[i]->minimum() + editableSoundSliders[i]->maximum()) / 2;
+        editableSoundSliders[i]->setValue(midpoint);
+        check(editableSoundValues[i]->value() == midpoint, "slider changes refresh their editable number");
+        undo(-1);
+        check(editableSoundValues[i]->value() == typedSoundTargets[i] &&
+                  editableSoundSliders[i]->value() == typedSoundTargets[i],
+              "undo keeps each slider and editable number synchronized");
+        undo(-1);
+        check(projectToJson(project) == beforeTyping && editableSoundValues[i]->value() == previousValue,
+              "undo typed sound edits restores the previous song and displayed value");
+        undo(1);
+        check(editableSoundValues[i]->value() == typedSoundTargets[i], "redo restores the typed sound value");
+        undo(-1);
+    }
+    const int originalTrack = timeline->track, anotherTrack = (originalTrack + 1) % TrackCount;
+    const auto beforeTrackSwitch = projectToJson(project);
+    const double anotherTrackLevel = project.tracks[anotherTrack].volume;
+    typeNumber(trackSoundValue[0], 91, false);
+    QTest::mouseClick(timeline, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(40, Timeline::Ruler + anotherTrack * Timeline::Row + 20));
+    check(timeline->track == anotherTrack && project.tracks[originalTrack].volume == .91 &&
+              project.tracks[anotherTrack].volume == anotherTrackLevel &&
+              trackSoundValue[0]->value() == int(std::round(anotherTrackLevel * 100)),
+          "focus-out typing commits to the original track before selecting another track");
+    undo(-1);
+    check(projectToJson(project) == beforeTrackSwitch, "undo restores typed edits after a track switch");
+    QTest::mouseClick(timeline, Qt::LeftButton, Qt::NoModifier,
+                      QPoint(40, Timeline::Ruler + originalTrack * Timeline::Row + 20));
+    check(trackSoundValue[0]->value() == int(std::round(project.tracks[originalTrack].volume * 100)),
+          "track selection displays that track's current editable values");
     QPoint empty(Timeline::Header + int(timeline->scale * .5), Timeline::Ruler + 2 * Timeline::Row + 20);
     QTest::mouseDClick(timeline, Qt::LeftButton, Qt::NoModifier, empty);
     check(project.tracks[2].clips.size() == 1, "double click creates timeline clip");
@@ -1308,6 +1405,67 @@ int Window::smokeTest(const QString& screenshot) {
     check(!noteSoundOverride[0]->isEnabled() && !noteSoundValue[0]->isEnabled() &&
               !noteSoundReset->isEnabled(),
           "note sound controls are disabled without a selected note");
+    const auto beforePitchNavigation = projectToJson(project);
+    const int beforePitchHistory = historyIndex;
+    const bool beforePitchDirty = dirty;
+    auto wheelPitch = [&](QPoint angle, QPoint pixels = {}) {
+        const QPoint position(100, 100);
+        QWheelEvent event(QPointF(position), QPointF(editor->mapToGlobal(position)), pixels, angle,
+                          Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(editor, &event);
+    };
+    check(pitchScroll->isVisible() && pitchScroll->pageStep() == 24,
+          "piano roll exposes a vertical scrollbar with a 24-semitone page");
+    pitchScroll->setValue(104);
+    check(editor->baseNote == 0, "bottom of pitch scrollbar reaches MIDI zero");
+    wheelPitch(QPoint(0, 120));
+    check(editor->baseNote == 3 && pitchScroll->value() == 101,
+          "one mouse-wheel notch moves three semitones and updates the scrollbar");
+    wheelPitch(QPoint(0, -120));
+    wheelPitch(QPoint(0, 20));
+    check(editor->baseNote == 0, "fractional wheel input waits for a complete semitone");
+    wheelPitch(QPoint(0, 20));
+    check(editor->baseNote == 1, "fractional wheel input accumulates from the lowest range");
+    wheelPitch({}, QPoint(0, 6));
+    wheelPitch({}, QPoint(0, 6));
+    check(editor->baseNote == 2 && pitchScroll->value() == 102,
+          "trackpad pixel input scrolls pitch smoothly");
+    wheelPitch(QPoint(120, 0));
+    wheelPitch({});
+    check(editor->baseNote == 2, "horizontal-only and zero wheel events leave pitch unchanged");
+    pitchScroll->setValue(0);
+    check(editor->baseNote == 104, "top of pitch scrollbar includes MIDI 127");
+    wheelPitch(QPoint(0, -20));
+    wheelPitch(QPoint(0, -20));
+    check(editor->baseNote == 103, "fractional scrolling also leaves the highest range");
+    auto* fitNotesButton = findChild<QPushButton*>("fitNotes");
+    if (fitNotesButton)
+        fitNotesButton->click();
+    check(editor->baseNote == 60 && pitchScroll->value() == 44 &&
+              projectToJson(project) == beforePitchNavigation && historyIndex == beforePitchHistory &&
+              dirty == beforePitchDirty,
+          "Fit notes synchronizes the scrollbar while view navigation leaves the song and history unchanged");
+    pitchScroll->setValue(104);
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(0));
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(0));
+    check(voice(0) && note->value() == 0, "lowest MIDI note can be drawn and selected");
+    pitchScroll->setValue(0);
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(127));
+    QTest::mouseClick(editor, Qt::LeftButton, Qt::ShiftModifier, noteAt(127));
+    check(voice(127) && note->value() == 127, "highest MIDI note can be drawn and selected");
+    note->setValue(24);
+    check(voice(24) && editor->baseNote <= 24 && editor->baseNote + 24 > 24 &&
+              pitchScroll->value() == 104 - editor->baseNote,
+          "typing an offscreen pitch reveals the selected note and updates the scrollbar");
+    note->setValue(127);
+    check(voice(127) && editor->baseNote == 104 && pitchScroll->value() == 0,
+          "typing MIDI 127 scrolls back to the highest range");
+    for (int i = 0; i < 4; ++i)
+        undo(-1);
+    editor->fitNotes();
+    check(projectToJson(project) == beforePitchNavigation && editor->baseNote == 60 &&
+              pitchScroll->value() == 44,
+          "undoing boundary-note exercises restores the empty phrase");
     QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(64));
     check(voice(64) && voice(64)->velocity > 0, "draw note in clip");
     QTest::mouseClick(editor, Qt::LeftButton, Qt::NoModifier, noteAt(60));
@@ -1345,7 +1503,7 @@ int Window::smokeTest(const QString& screenshot) {
     };
     check(inheritsSound(voice(64)) && !noteSoundOverride[3]->isChecked() && !noteSoundValue[3]->isEnabled(),
           "new notes inherit track sound settings");
-    decay->setValue(79);
+    typeNumber(trackSoundValue[3], 79);
     check(noteSoundValue[3]->value() == 79 && inheritsSound(voice(64)),
           "changing track decay refreshes inherited note sound without creating overrides");
     noteSoundOverride[3]->setChecked(true);
@@ -1360,11 +1518,11 @@ int Window::smokeTest(const QString& screenshot) {
               voice(64)->overrides.tone == .64 && voice(64)->overrides.decay == .22 &&
               voice(64)->overrides.drive == 0 && inheritsSound(voice(60)) && inheritsSound(voice(67)),
           "all five sound controls affect only the selected chord tone and preserve explicit zero");
-    volume->setValue(88);
-    pan->setValue(25);
-    tone->setValue(90);
-    decay->setValue(60);
-    drive->setValue(35);
+    typeNumber(trackSoundValue[0], 88);
+    typeNumber(trackSoundValue[1], 25);
+    typeNumber(trackSoundValue[2], 90);
+    typeNumber(trackSoundValue[3], 60);
+    typeNumber(trackSoundValue[4], 35);
     bool pinnedUnchanged = true;
     for (size_t i = 0; i < soundValues.size(); ++i)
         pinnedUnchanged &= noteSoundValue[i]->value() == soundValues[i];
@@ -1819,6 +1977,15 @@ int Window::smokeTest(const QString& screenshot) {
     auto* outer = qobject_cast<QScrollArea*>(centralWidget());
     check(outer && outer->widget()->height() > outer->viewport()->height(),
           "small window scrolls without hiding controls");
+    check(outer && outer->widget()->width() <= outer->viewport()->width(),
+          "editable lower controls fit the minimum window width");
+    if (outer && !screenshot.isEmpty()) {
+        outer->ensureWidgetVisible(noteSoundReset);
+        QTest::qWait(30);
+        const QFileInfo capture(screenshot);
+        const auto controlsPath = capture.dir().filePath(capture.completeBaseName() + "-controls.png");
+        check(grab().save(controlsPath), "small-window controls screenshot");
+    }
     check(nextDeletionAnswer == deletionAnswers.size(),
           "all expected deletion confirmations were displayed and answered");
     dirty = false;
