@@ -1,5 +1,7 @@
 # FERRO
 
+### 형제앱:[FerroMC](https://github.com/studyreadbook4ever/FerroMC)
+
 **6트랙 음악 작업 화면과 에이전트용 작곡 CLI를 함께 제공하는 Linux DAW입니다.** 
 에이전트는 `ferro-agent`로 음표·화음·프레이즈·클립을 JSON 계획에 적어 한 번에 적용합니다. 실행 중인 창을 직접 편집하거나 화면 없이 프로젝트와 WAV를 만들 수 있습니다. **[에이전트 사용법](docs/AGENT_CLI.md)** · **[에이전트 지침](AGENTS.md)** · **[실행 가능한 4마디 계획](examples/agent-four-bars.json)**
 
